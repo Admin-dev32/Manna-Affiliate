@@ -9,31 +9,10 @@ function pkgToHours(pkg){ if(pkg==='50-150-5h')return 2; if(pkg==='150-250-5h')r
 function addH(d,h){ return new Date(d.getTime()+h*3600e3); }
 
 export default async function handler(req,res){
-  // CORS
-  const allow = (process.env.ALLOWED_ORIGINS || '').split(',').map(s=>s.trim()).filter(Boolean);
-  const origin = req.headers.origin || '';
-  const okOrigin = allow.length ? allow.includes(origin) : true;
-
-  if (req.method === 'OPTIONS'){
-    res.setHeader('Access-Control-Allow-Origin', okOrigin ? origin : '*');
-    res.setHeader('Access-Control-Allow-Methods', 'POST,OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-    res.setHeader('Vary','Origin');
-    return res.status(204).end();
-  }
-  res.setHeader('Access-Control-Allow-Origin', okOrigin ? origin : '*');
-  res.setHeader('Access-Control-Allow-Methods', 'POST,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-  res.setHeader('Vary','Origin');
-
-  if (req.method!=='POST') return res.status(405).json({ ok:false, error:'Method not allowed' });
-
   try{
     const pb = req.body || {};
-    // 🔐 Afiliado obligatorio
     const aff = resolveAffiliate(String(pb.pin||'').trim());
     if(!aff) return res.status(401).json({ ok:false, error:'Invalid affiliate PIN' });
-
     if(!pb.startISO || !pb.pkg) return res.status(400).json({ ok:false, error:'startISO and pkg required' });
 
     const tz = process.env.TIMEZONE || 'America/Los_Angeles';
@@ -45,19 +24,24 @@ export default async function handler(req,res){
     const startISO = addH(startLive, -PREP_HOURS).toISOString();
     const endISO   = addH(startLive,  live + CLEAN_HOURS).toISOString();
 
-    // comisiones
-    const comm = calcAffiliateCommissions(aff, { pkg: pb.pkg, secondEnabled: !!pb.secondEnabled });
+    // commissions (now includes fountain)
+    const comm = calcAffiliateCommissions(aff, {
+      pkg: pb.pkg,
+      secondEnabled: !!pb.secondEnabled,
+      fountainEnabled: !!pb.fountainEnabled
+    });
 
     const description = [
-      `MANAGER CREATE — affiliate`,
-      `Affiliate: ${aff.name} (${aff.id}) — Commission: $${comm.main} + $${comm.second} = $${comm.totalCommission}`,
+      `AFFILIATE DIRECT BOOKING`,
+      `Affiliate: ${aff.name} (${aff.id})`,
+      `Commission: main $${comm.main} + second $${comm.second} + fountain $${comm.fountain} = $${comm.totalCommission}`,
       pb.fullName ? `Client: ${pb.fullName}` : '',
       pb.email ? `Email: ${pb.email}` : '',
       pb.phone ? `Phone: ${pb.phone}` : '',
       pb.venue ? `Venue: ${pb.venue}` : '',
-      `Package: ${pb.pkg} — Main: ${pb.mainBar}`,
-      pb.secondEnabled ? `Second: ${pb.secondBar} — size ${pb.secondSize}` : '',
-      pb.fountainEnabled ? `Fountain: ${pb.fountainSize} (${pb.fountainType})` : '',
+      `Package: ${pb.pkg} — Main bar: ${pb.mainBar}`,
+      pb.secondEnabled ? `Second bar: ${pb.secondBar} — size ${pb.secondSize}` : '',
+      pb.fountainEnabled ? `Chocolate fountain: ${pb.fountainSize} (${pb.fountainType})` : '',
       `Total: $${pb.total} | Deposit: $${pb.deposit} | Balance: $${pb.balance}`,
       pb.notes ? `Notes: ${pb.notes}` : ''
     ].filter(Boolean).join('\n');

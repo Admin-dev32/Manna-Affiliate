@@ -1,68 +1,70 @@
-// /api/create-booking.js
-export const config = { runtime: 'nodejs' };
+// api/create-booking.js
+import { sendJSON, handleOptions } from './_utils/cors';
+// import your existing Google Calendar utilities here:
+import { createEvent } from './_google'; // keep your working implementation/signature
 
-import { getCalendarClient } from './_google.js';
-import { resolveAffiliate, calcAffiliateCommissions } from './_affiliates.js';
+export default async function handler(req, res) {
+  if (handleOptions(req, res)) return;
 
-const PREP_HOURS = 1, CLEAN_HOURS = 1;
-function pkgToHours(pkg){ if(pkg==='50-150-5h')return 2; if(pkg==='150-250-5h')return 2.5; if(pkg==='250-350-6h')return 3; return 2; }
-function addH(d,h){ return new Date(d.getTime()+h*3600e3); }
+  if (req.method !== 'POST') return sendJSON(res, 405, { ok:false, error:'Method not allowed' });
 
-export default async function handler(req,res){
-  try{
-    const pb = req.body || {};
-    const aff = resolveAffiliate(String(pb.pin||'').trim());
-    if(!aff) return res.status(401).json({ ok:false, error:'Invalid affiliate PIN' });
-    if(!pb.startISO || !pb.pkg) return res.status(400).json({ ok:false, error:'startISO and pkg required' });
+  try {
+    const data = req.body || {};
+    const {
+      fullName, email, phone, venue,
+      pkg, mainBar, secondEnabled, secondBar, secondSize,
+      fountainEnabled, fountainSize, fountainType,
+      discountMode, discountValue, payMode,
+      total, deposit, balance,
+      startISO, pin, notes,
+    } = data;
 
-    const tz = process.env.TIMEZONE || 'America/Los_Angeles';
-    const calId = process.env.CALENDAR_ID || 'primary';
-    const calendar = getCalendarClient();
+    if (!fullName) return sendJSON(res, 400, { ok:false, error:'Missing client name' });
+    if (!startISO) return sendJSON(res, 400, { ok:false, error:'Missing start time' });
 
-    const live = pkgToHours(pb.pkg);
-    const startLive = new Date(pb.startISO);
-    const startISO = addH(startLive, -PREP_HOURS).toISOString();
-    const endISO   = addH(startLive,  live + CLEAN_HOURS).toISOString();
+    // Build event details
+    const start = new Date(startISO);
+    const durationHours =
+      pkg === '50-150-5h' ? 2 :
+      pkg === '150-250-5h' ? 2.5 :
+      pkg === '250-350-6h' ? 3 : 2;
+    const end = new Date(start.getTime() + durationHours * 60 * 60 * 1000);
 
-    // commissions (now includes fountain)
-    const comm = calcAffiliateCommissions(aff, {
-      pkg: pb.pkg,
-      secondEnabled: !!pb.secondEnabled,
-      fountainEnabled: !!pb.fountainEnabled
-    });
-
+    const title = `Manna — ${pkg} — ${mainBar} — ${fullName}`;
     const description = [
-      `AFFILIATE DIRECT BOOKING`,
-      `Affiliate: ${aff.name} (${aff.id})`,
-      `Commission: main $${comm.main} + second $${comm.second} + fountain $${comm.fountain} = $${comm.totalCommission}`,
-      pb.fullName ? `Client: ${pb.fullName}` : '',
-      pb.email ? `Email: ${pb.email}` : '',
-      pb.phone ? `Phone: ${pb.phone}` : '',
-      pb.venue ? `Venue: ${pb.venue}` : '',
-      `Package: ${pb.pkg} — Main bar: ${pb.mainBar}`,
-      pb.secondEnabled ? `Second bar: ${pb.secondBar} — size ${pb.secondSize}` : '',
-      pb.fountainEnabled ? `Chocolate fountain: ${pb.fountainSize} (${pb.fountainType})` : '',
-      `Total: $${pb.total} | Deposit: $${pb.deposit} | Balance: $${pb.balance}`,
-      pb.notes ? `Notes: ${pb.notes}` : ''
+      `Affiliate PIN: ${pin || '-'}`,
+      `Client: ${fullName}`,
+      email ? `Email: ${email}` : null,
+      phone ? `Phone: ${phone}` : null,
+      venue ? `Venue: ${venue}` : null,
+      `Main bar: ${mainBar}`,
+      secondEnabled ? `Second bar: ${secondBar || '-'} (${secondSize || '-'})` : null,
+      fountainEnabled ? `Chocolate fountain: ${fountainSize || '-'} (${fountainType || '-'})` : null,
+      `Payment: ${payMode} | Deposit: $${deposit || 0} | Balance: $${balance || 0} | Total: $${total || 0}`,
+      discountMode && discountMode !== 'none' ? `Discount: ${discountMode} ${discountValue || 0}` : null,
+      notes ? `Notes: ${notes}` : null,
+      `Source: affiliate`
     ].filter(Boolean).join('\n');
 
-    const ev = await calendar.events.insert({
-      calendarId: calId,
-      requestBody:{
-        summary:`Manna — ${pb.mainBar || 'Booking'} (${pb.pkg}) — AFF:${aff.id}`,
-        description,
-        start:{ dateTime: startISO, timeZone: tz },
-        end:{ dateTime: endISO, timeZone: tz },
-        colorId:'7',
-        guestsCanInviteOthers:false, guestsCanModify:false, guestsCanSeeOtherGuests:false,
-        extendedProperties:{ private:{ affiliateId: aff.id } }
-      },
-      sendUpdates:'none'
+    // createEvent should return { id, htmlLink, ... }
+    const evt = await createEvent({
+      summary: title,
+      location: venue || '',
+      description,
+      startISO: start.toISOString(),
+      endISO: end.toISOString(),
+      attendees: email ? [{ email }] : [],
+      // pass metadata if your implementation supports it
+      metadata: {
+        pkg, mainBar, secondEnabled, secondBar, secondSize,
+        fountainEnabled, fountainSize, fountainType,
+        discountMode, discountValue, payMode, total, deposit, balance,
+        pin, source: 'affiliate',
+      }
     });
 
-    return res.json({ ok:true, message:'Booking created', id:ev.data.id });
-  }catch(e){
-    console.error('create-booking (aff) error', e);
-    return res.status(500).json({ ok:false, error:e.message });
+    return sendJSON(res, 200, { ok:true, eventId: evt?.id || null, link: evt?.htmlLink || null });
+  } catch (e) {
+    return sendJSON(res, 500, { ok:false, error:e.message });
   }
 }

@@ -1,31 +1,13 @@
 // api/create-checkout.js
 import Stripe from 'stripe';
+import { sendJSON, handleOptions } from './_utils/cors';
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: '2024-06-20' });
 
-const ok = (body) => ({
-  statusCode: 200,
-  headers: cors(),
-  body: JSON.stringify({ ok: true, ...body }),
-});
-const bad = (msg, code = 400) => ({
-  statusCode: code,
-  headers: cors(),
-  body: JSON.stringify({ ok: false, error: msg }),
-});
-const cors = () => ({
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'POST,OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type',
-});
-
 export default async function handler(req, res) {
-  if (req.method === 'OPTIONS') {
-    res.set(cors()); return res.status(200).end();
-  }
-  if (req.method !== 'POST') {
-    res.set(cors()); return res.status(405).json({ ok:false, error:'Method not allowed' });
-  }
+  if (handleOptions(req, res)) return;
+
+  if (req.method !== 'POST') return sendJSON(res, 405, { ok:false, error:'Method not allowed' });
 
   try {
     const data = req.body || {};
@@ -38,17 +20,16 @@ export default async function handler(req, res) {
       startISO, pin, notes,
     } = data;
 
-    // Build line items (simple single line item with metadata)
-    const amount = Math.round((payMode === 'full' ? total : (deposit || 0)) * 100);
+    const amount = Math.round(((payMode === 'full' ? total : (deposit || 0)) || 0) * 100);
+    if (!amount || amount < 50) return sendJSON(res, 400, { ok:false, error:'Amount must be ≥ $0.50' });
 
-    if (!amount || amount < 50) {
-      return res.status(400).set(cors()).json({ ok:false, error:'Amount must be ≥ $0.50' });
-    }
+    const successURL = process.env.PUBLIC_SUCCESS_URL || 'https://manna-affiliate.vercel.app/success';
+    const cancelURL  = process.env.PUBLIC_CANCEL_URL  || 'https://manna-affiliate.vercel.app/cancel';
 
     const session = await stripe.checkout.sessions.create({
       mode: 'payment',
-      success_url: `${process.env.PUBLIC_SUCCESS_URL || 'https://manna-affiliate.vercel.app'}/success`,
-      cancel_url: `${process.env.PUBLIC_CANCEL_URL || 'https://manna-affiliate.vercel.app'}/cancel`,
+      success_url: successURL,
+      cancel_url: cancelURL,
       customer_email: email || undefined,
       line_items: [{
         quantity: 1,
@@ -72,10 +53,8 @@ export default async function handler(req, res) {
       },
     });
 
-    res.set(cors());
-    return res.status(200).json({ ok:true, url:session.url });
+    return sendJSON(res, 200, { ok:true, url:session.url });
   } catch (e) {
-    res.set(cors());
-    return res.status(500).json({ ok:false, error:e.message });
+    return sendJSON(res, 500, { ok:false, error:e.message });
   }
 }

@@ -1,28 +1,24 @@
 // /api/auth/login.js
-import { resolveAffiliate } from './_affiliates.js';
+import { applyCors, preflight } from '../_cors.js';
+import { resolveAffiliate } from '../_affiliates.js';
 
 export default async function handler(req, res) {
+  if (preflight(req, res)) return;
+  applyCors(res);
+
+  if (req.method !== 'POST') {
+    return res.status(405).json({ ok:false, error:'Method not allowed' });
+  }
+
   try {
-    // Asegura parseo de body en cualquier runtime
-    let pin = null;
-    if (req.body && typeof req.body === 'object') {
-      pin = req.body.pin;
-    } else {
-      // fallback: intenta leer el raw body
-      const chunks = [];
-      for await (const c of req) chunks.push(c);
-      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
-      const parsed = JSON.parse(raw);
-      pin = parsed.pin;
-    }
+    const { pin } = req.body || {};
+    if (!pin) return res.status(400).json({ ok:false, error:'Missing pin' });
 
-    const aff = resolveAffiliate(pin);
-    if (!aff) {
-      return res.status(200).json({ ok: false, error: 'Invalid PIN' });
-    }
+    const affiliate = resolveAffiliate(pin);
+    if (!affiliate) return res.status(401).json({ ok:false, error:'Invalid PIN' });
 
-    return res.status(200).json({ ok: true, affiliate: aff });
+    return res.status(200).json({ ok:true, affiliate });
   } catch (e) {
-    return res.status(200).json({ ok: false, error: e.message || 'Login error' });
+    return res.status(500).json({ ok:false, error:e.message || 'Login error' });
   }
 }

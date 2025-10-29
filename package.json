@@ -1,0 +1,12 @@
+{
+  "name": "manna-webhooks",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Stripe checkout + webhooks + Google Calendar (serverless on Vercel)",
+  "engines": { "node": ">=18" },
+  "dependencies": {
+    "googleapis": "^131.0.0",
+    "stripe": "^14.0.0"
+  }
+}

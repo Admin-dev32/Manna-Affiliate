@@ -1,55 +1,100 @@
 // /api/availability.js
-import { applyCors, preflight } from './_cors.js';
-import { getCalendarClient, fetchBusyForDate } from './_google.js';
+import { getCalendar, TZ, toDateTz, listEventsOnDate } from '../_google';
 
-function toISO(date) { return new Date(date).toISOString(); }
+// Reglas de negocio
+const BUSINESS_OPEN_HOUR = 9;   // 9 AM
+const BUSINESS_CLOSE_HOUR = 22; // 10 PM (la hora de inicio no puede pasar de aquí)
+const MAX_CONCURRENT = 2;       // máx. 2 eventos a la vez
+const MAX_PER_DAY = 3;          // máx. 3 eventos por día
 
-// Generate candidate start times (local day → convert to UTC ISO)
-function generateCandidateSlots(localDateStr, blockHours) {
-  // business window: 9:00–20:00 local (feel free to adjust)
-  const starts = [];
-  const [y, m, d] = localDateStr.split('-').map(Number);
-  for (let h = 9; h <= 18; h++) { // last start at 18:00 for 2h block
-    const dt = new Date(y, m - 1, d, h, 0, 0); // local time
-    const end = new Date(dt.getTime() + blockHours * 60 * 60 * 1000);
-    starts.push({ start: dt, end });
-  }
-  return starts;
+// Duración por paquete (solo servicio)
+function serviceHours(pkg) {
+  if (pkg === '50-150-5h') return 2;
+  if (pkg === '150-250-5h') return 2.5;
+  if (pkg === '250-350-6h') return 3;
+  return 2;
 }
 
-function isFree(candidate, busy) {
-  return !busy.some(b => {
-    // overlaps if candidate.start < b.end && candidate.end > b.start
-    return candidate.start < b.end && candidate.end > b.start;
-  });
+// Duración total = 1h buffer + servicio + 1h limpieza
+function totalHours(pkg) {
+  return 1 + serviceHours(pkg) + 1;
+}
+
+function addHours(date, h) {
+  return new Date(date.getTime() + h * 60 * 60 * 1000);
+}
+
+function* generateStartTimes(dayStart) {
+  // Genera cada 30 minutos entre 9:00 y 22:00
+  const start = new Date(dayStart);
+  start.setHours(BUSINESS_OPEN_HOUR, 0, 0, 0);
+
+  const end = new Date(dayStart);
+  end.setHours(BUSINESS_CLOSE_HOUR, 0, 0, 0);
+
+  for (let t = new Date(start); t < end; t = new Date(t.getTime() + 30 * 60 * 1000)) {
+    yield new Date(t);
+  }
+}
+
+// Cuenta cuántos eventos existen solapando [start, end)
+function concurrentAt(events, start, end) {
+  let c = 0;
+  for (const ev of events) {
+    const evStart = new Date(ev.start);
+    const evEnd = new Date(ev.end);
+    // solapamiento: inicio < finOtro && fin > inicioOtro
+    if (start < evEnd && end > evStart) c++;
+  }
+  return c;
 }
 
 export default async function handler(req, res) {
-  if (preflight(req, res)) return;
-  applyCors(res);
-
   try {
-    const { date, hours } = req.query || {};
-    if (!date) return res.status(400).json({ ok: false, error: 'Missing date' });
-    const blockHours = Math.max(1, Number(hours || 2));
+    const { date, hours, pkg } = req.query;
 
-    const calendar = await getCalendarClient();
-    const calendarId = process.env.GOOGLE_CALENDAR_ID;
-    if (!calendarId) {
-      // Fallback: return simple “open” slots if calendar missing
-      const simple = generateCandidateSlots(date, blockHours).map(s => ({
-        startISO: toISO(s.start), endISO: toISO(s.end)
-      }));
-      return res.status(200).json({ ok: true, slots: simple });
+    if (!date) return res.status(400).json({ ok: false, error: 'Missing date' });
+
+    const cal = await getCalendar();
+    // Día en zona horaria de negocio
+    const dayLocal = toDateTz(date, TZ); // 00:00 de ese día en TZ
+    const dayEndLocal = addHours(dayLocal, 24);
+
+    // Trae eventos del día (en TZ) para checar topes y solapamientos
+    const events = await listEventsOnDate(cal, dayLocal, dayEndLocal);
+
+    // Máximo por día
+    if ((events || []).length >= MAX_PER_DAY) {
+      return res.json({ ok: true, slots: [] });
     }
 
-    const busy = await fetchBusyForDate(calendar, calendarId, date);
-    const candidates = generateCandidateSlots(date, blockHours);
-    const free = candidates.filter(c => isFree(c, busy))
-      .map(s => ({ startISO: toISO(s.start), endISO: toISO(s.end) }));
+    // Duración total de la reserva por paquete
+    const totalH = Number.isFinite(Number(hours)) ? Number(hours) : totalHours(pkg || '');
+    const slots = [];
 
-    return res.status(200).json({ ok: true, slots: free });
+    for (const startLocal of generateStartTimes(dayLocal)) {
+      const endLocal = addHours(startLocal, totalH);
+
+      // No permitir que el bloque total empuje el fin del trabajo más allá de 23:59 del día
+      if (endLocal > dayEndLocal) continue;
+
+      // Checar concurrencia
+      const conc = concurrentAt(events, startLocal, endLocal);
+      if (conc >= MAX_CONCURRENT) continue;
+
+      // Si al agregar este evento rebasaría el máximo por día, también descártalo
+      if (events.length + 1 > MAX_PER_DAY) continue;
+
+      // Publicar la hora en ISO (TZ correcta)
+      slots.push({
+        startISO: new Date(startLocal).toISOString(),
+        endISO: new Date(endLocal).toISOString()
+      });
+    }
+
+    res.json({ ok: true, slots });
   } catch (e) {
-    return res.status(500).json({ ok: false, error: e.message || 'Availability error' });
+    console.error('availability error', e);
+    res.status(500).json({ ok: false, error: e.message || 'Availability failed' });
   }
 }

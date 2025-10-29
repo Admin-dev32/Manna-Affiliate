@@ -1,148 +1,142 @@
-// /api/checkout.js
-// Crea una sesión de Stripe Checkout calculando los importes con tu misma lógica.
+// /api/create-checkout.js
+// Crea una sesión de Stripe Checkout. Cobra "due now":
+// - Si payMode === 'full' → total - $20
+// - Si no → depósito (si no mandan depósito, usa 25% del total)
 
-export const config = { runtime: 'nodejs' };   // valid on Vercel
+export const config = { runtime: "nodejs" };
 
-import Stripe from 'stripe';
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: '2024-06-20' });
+import Stripe from "stripe";
 
-// Map your package to “live service hours” (matches your UI)
-function pkgToHours(pkg) {
-  if (pkg === '50-150-5h') return 2;
-  if (pkg === '150-250-5h') return 2.5;
-  if (pkg === '250-350-6h') return 3;
-  return 2;
+function setCors(req, res) {
+  const allow = (process.env.ALLOWED_ORIGINS || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const origin = req.headers.origin || "";
+  const okOrigin = allow.length ? allow.includes(origin) : true;
+
+  res.setHeader("Access-Control-Allow-Origin", okOrigin ? origin : "*");
+  res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Vary", "Origin");
 }
 
-// ====== Tabla de precios (idéntica al widget) ======
-const BASE_PRICES = { "50-150-5h": 550, "150-250-5h": 700, "250-350-6h": 900 };
-const SECOND_DISCOUNT = { "50-150-5h": 50, "150-250-5h": 75, "250-350-6h": 100 };
-const FOUNTAIN_PRICE = { "50": 350, "100": 450, "150": 550 };
-const FOUNTAIN_WHITE_UPCHARGE = 50;
-const FULL_FLAT_OFF = 20; // $20 off when paying in full (matches frontend)
+export default async function handler(req, res) {
+  setCors(req, res);
+  if (req.method === "OPTIONS") return res.status(204).end();
+  if (req.method !== "POST")
+    return res.status(405).json({ ok: false, error: "Method not allowed" });
 
-const BAR_META = {
-  pancake:   { title: "🥞 Mini Pancake",  priceAdd: 0 },
-  esquites:  { title: "🌽 Esquites",      priceAdd: 0 },
-  maruchan:  { title: "🍜 Maruchan",      priceAdd: 0 },
-  tostiloco: { title: "🌶️ Tostiloco (Premium)", priceAdd: 50 },
-  snack:     { title: "🍭 Manna Snack Bar — “La Clásica”", priceAdd: 0 } // NEW standard bar
-};
+  try {
+    const stripeSecret = process.env.STRIPE_SECRET_KEY;
+    if (!stripeSecret)
+      return res.status(500).json({ ok: false, error: "STRIPE_SECRET_KEY missing" });
 
-function usd(n){ return Math.round(n * 100); } // dollars → cents
+    const stripe = new Stripe(stripeSecret, { apiVersion: "2022-11-15" });
 
-function computeTotals(pb){
-  const base0 = BASE_PRICES[pb.pkg] || 0;
-  const addMain = (BAR_META[pb.mainBar]?.priceAdd) || 0;
-  const base = base0 + addMain;
+    const body = req.body || {};
 
-  let extras = 0;
-  if (pb.secondEnabled){
-    const b = BASE_PRICES[pb.secondSize] || 0;
-    const d = SECOND_DISCOUNT[pb.secondSize] || 0;
-    extras += Math.max(b - d, 0);
-  }
-  if (pb.fountainEnabled){
-    const b = FOUNTAIN_PRICE[pb.fountainSize] || 0;
-    const up = (pb.fountainType === 'white' || pb.fountainType === 'mixed') ? FOUNTAIN_WHITE_UPCHARGE : 0;
-    extras += (b + up);
-  }
+    // Datos esperados desde el HTML (ver gather() en tu frontend)
+    const {
+      fullName, email, phone, venue,
+      dateISO, startISO,
+      pkg, mainBar,
+      secondEnabled, secondBar, secondSize,
+      fountainEnabled, fountainSize, fountainType,
+      discountMode, discountValue,
+      payMode, deposit, total, balance,
+      pin, affiliateName, notes
+    } = body;
 
-  const total = base + extras;
-
-  if (pb.payMode === 'full'){
-    const dueNow = Math.max(total - FULL_FLAT_OFF, 0);
-    return { total, dueNow, paySavings: FULL_FLAT_OFF };
-  } else {
-    return { total, dueNow: Math.round(total * 0.25), paySavings: 0 };
-  }
-}
-
-export default async function handler(req, res){
-  // ===== CORS básico =====
-  const allowList = (process.env.ALLOWED_ORIGINS || '').split(',').map(s=>s.trim()).filter(Boolean);
-  const origin = req.headers.origin || '';
-  const okOrigin = allowList.length ? allowList.includes(origin) : true;
-
-  if (req.method === 'OPTIONS'){
-    res.setHeader('Access-Control-Allow-Origin', okOrigin ? origin : '*');
-    res.setHeader('Access-Control-Allow-Methods', 'POST,OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-    res.setHeader('Vary', 'Origin');
-    return res.status(204).end();
-  }
-  res.setHeader('Access-Control-Allow-Origin', okOrigin ? origin : '*');
-  res.setHeader('Access-Control-Allow-Methods', 'POST,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-  res.setHeader('Vary', 'Origin');
-
-  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
-
-  try{
-    const pb = req.body || {};
-
-    // Validaciones mínimas
-    if (!pb.pkg || !pb.mainBar || !pb.payMode) {
-      return res.status(400).json({ error: 'Missing fields (pkg, mainBar, payMode)' });
+    if (!pkg || !startISO || total == null) {
+      return res.status(400).json({ ok: false, error: "Missing pkg/startISO/total" });
     }
 
-    const { total, dueNow } = computeTotals(pb);
+    // ====== Cálculo del "due now" ======
+    let amountDue;
+    if (payMode === "full") {
+      const fullFlatOff = 20;
+      amountDue = Math.max(0, Math.round((Number(total) - fullFlatOff) * 100)); // cents
+    } else {
+      const dep = (deposit != null && deposit !== "") ? Number(deposit) : Math.round(Number(total) * 0.25);
+      amountDue = Math.max(0, Math.round(dep * 100));
+    }
+    if (amountDue <= 0) {
+      return res.status(400).json({ ok: false, error: "Amount due is zero" });
+    }
 
-    // Nombre que verá el cliente en Checkout
-    const barTitle = (BAR_META[pb.mainBar]?.title) || 'Snack Bar';
-    const labels = { "50-150-5h":"50–150 (5 hrs)", "150-250-5h":"150–250 (5 hrs)", "250-350-6h":"250–350 (6 hrs)" };
-    const name = `Manna — ${barTitle} • ${labels[pb.pkg] || ''} • ${pb.payMode === 'full' ? 'Pay in full' : '25% deposit'}`;
+    // ====== Líneas de producto (1 ítem con resumen) ======
+    const title = `Manna — ${mainBar || "Booking"} (${pkg})`;
+    const descriptionParts = [
+      fullName ? `Client: ${fullName}` : "",
+      phone ? `Phone: ${phone}` : "",
+      venue ? `Venue: ${venue}` : "",
+      `Date: ${dateISO || startISO?.slice(0, 10)}`,
+      `Start live: ${startISO}`,
+      secondEnabled ? `2nd Bar: ${secondBar} (${secondSize})` : "",
+      fountainEnabled ? `Fountain: ${fountainSize} ${fountainType ? "(" + fountainType + ")" : ""}` : "",
+      discountMode && discountMode !== "none" ? `Discount: ${discountMode} ${discountValue || ""}` : "",
+      payMode === "full" ? "Mode: Pay in full (auto -$20)" : "Mode: Deposit",
+      balance != null ? `Balance after payment: $${balance}` : "",
+      notes ? `Notes: ${notes}` : ""
+    ].filter(Boolean);
 
-    // ✅ Always send users to homepage after success/cancel.
-    // If PUBLIC_URL exists, use it; otherwise default to your domain.
-    const BASE_URL = (process.env.PUBLIC_URL || 'https://mannasnackbars.com').replace(/\/+$/, '');
-    const successUrl = `${BASE_URL}/`;
-    const cancelUrl  = `${BASE_URL}/`;
+    // ====== Metadata (para el webhook) ======
+    const metadata = {
+      fullName: String(fullName || ""),
+      email: String(email || ""),
+      phone: String(phone || ""),
+      venue: String(venue || ""),
+      dateISO: String(dateISO || ""),
+      startISO: String(startISO || ""),
+      pkg: String(pkg || ""),
+      mainBar: String(mainBar || ""),
+      secondEnabled: String(!!secondEnabled),
+      secondBar: String(secondBar || ""),
+      secondSize: String(secondSize || ""),
+      fountainEnabled: String(!!fountainEnabled),
+      fountainSize: String(fountainSize || ""),
+      fountainType: String(fountainType || ""),
+      discountMode: String(discountMode || ""),
+      discountValue: String(discountValue || ""),
+      payMode: String(payMode || ""),
+      deposit: deposit != null ? String(deposit) : "",
+      total: total != null ? String(total) : "",
+      balance: balance != null ? String(balance) : "",
+      pin: String(pin || ""),
+      affiliateName: String(affiliateName || ""),
+      notes: String(notes || "")
+    };
+
+    const successBase = process.env.PUBLIC_URL || "https://example.com";
+    const cancelBase = process.env.PUBLIC_URL || "https://example.com";
 
     const session = await stripe.checkout.sessions.create({
-      mode: 'payment',
-      allow_promotion_codes: false,
-      payment_method_types: ['card'],
-      line_items: [{
-        price_data: {
-          currency: 'usd',
-          product_data: { name },
-          unit_amount: usd(dueNow) // show exactly what you charge now
-        },
-        quantity: 1
-      }],
-      success_url: successUrl,
-      cancel_url: cancelUrl,
-      metadata: {
-        // data needed for webhook -> Google Calendar
-        pkg: pb.pkg,
-        mainBar: pb.mainBar,
-        payMode: pb.payMode,
-        secondEnabled: String(!!pb.secondEnabled),
-        secondBar: pb.secondBar || '',
-        secondSize: pb.secondSize || '',
-        fountainEnabled: String(!!pb.fountainEnabled),
-        fountainSize: pb.fountainSize || '',
-        fountainType: pb.fountainType || '',
-        total: String(total),
-        dueNow: String(dueNow),
-
-        // customer / booking
-        dateISO: pb.dateISO || '',
-        startISO: pb.startISO || '',
-        fullName: pb.fullName || pb.name || '',
-        email: pb.email || '',
-        phone: pb.phone || '',
-        venue: pb.venue || '',
-        setup: pb.setup || '',
-        power: pb.power || '',
-        hours: String(pkgToHours(pb.pkg)) // used by calendar block length
-      }
+      mode: "payment",
+      payment_method_types: ["card"],
+      billing_address_collection: "auto",
+      customer_email: email || undefined,
+      line_items: [
+        {
+          price_data: {
+            currency: "usd",
+            product_data: {
+              name: title,
+              description: descriptionParts.join(" • ")
+            },
+            unit_amount: amountDue
+          },
+          quantity: 1
+        }
+      ],
+      success_url: `${successBase}/thank-you?status=paid&session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${cancelBase}/checkout-cancelled`,
+      metadata
     });
 
-    return res.status(200).json({ url: session.url });
-  }catch(e){
-    console.error('checkout error', e);
-    return res.status(500).json({ error: 'Checkout failed', detail: e.message });
+    return res.json({ ok: true, url: session.url, sessionId: session.id });
+  } catch (e) {
+    console.error("create-checkout error:", e);
+    return res.status(500).json({ ok: false, error: e.message });
   }
 }

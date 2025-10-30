@@ -1,90 +1,114 @@
 // /api/stripe/webhook.js
-export const config = { runtime: 'nodejs' };
+export const config = {
+  runtime: 'nodejs',
+  api: { bodyParser: false }, // needed to verify Stripe signature
+};
 
 import Stripe from 'stripe';
+import getRawBody from 'raw-body';
 
-function readRawBody(req){
-  return new Promise((resolve, reject)=>{
-    const chunks=[];
-    req.on('data', c=>chunks.push(Buffer.from(c)));
-    req.on('end', ()=>resolve(Buffer.concat(chunks)));
-    req.on('error', reject);
-  });
+function json(res, code, obj) {
+  res.status(code).json(obj);
 }
 
-export default async function handler(req, res){
-  if (req.method !== 'POST') return res.status(405).json({ ok:false, error:'method_not_allowed' });
+export default async function handler(req, res) {
+  if (req.method !== 'POST') {
+    return json(res, 405, { ok: false, error: 'method_not_allowed' });
+  }
 
-  const secretKey = process.env.STRIPE_SECRET_KEY;
+  const stripeSecret = process.env.STRIPE_SECRET_KEY;
   const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
-  if (!secretKey || !webhookSecret) return res.status(500).json({ ok:false, error:'missing_stripe_env' });
+  if (!stripeSecret || !webhookSecret) {
+    return json(res, 500, { ok: false, error: 'missing_stripe_env' });
+  }
 
-  const stripe = new Stripe(secretKey, { apiVersion: '2025-09-30.clover' });
-
-  let rawBody;
-  try { rawBody = await readRawBody(req); }
-  catch (e) { return res.status(400).json({ ok:false, error:'raw_body_failed', detail:String(e) }); }
+  const stripe = new Stripe(stripeSecret, { apiVersion: '2022-11-15' });
 
   let event;
   try {
-    event = stripe.webhooks.constructEvent(rawBody, req.headers['stripe-signature'], webhookSecret);
-  } catch (e) {
-    return res.status(400).json({ ok:false, error:'signature_verification_failed', detail:e.message });
+    const raw = await getRawBody(req);
+    const sig = req.headers['stripe-signature'];
+    event = stripe.webhooks.constructEvent(raw, sig, webhookSecret);
+  } catch (err) {
+    console.error('stripe webhook verify failed:', err?.message || err);
+    return json(res, 400, { ok: false, error: 'invalid_signature' });
+  }
+
+  // We only handle completed checkouts
+  if (event.type !== 'checkout.session.completed') {
+    return json(res, 200, { ok: true, ignored: event.type });
   }
 
   try {
-    if (event.type === 'checkout.session.completed') {
-      const session = event.data.object;
+    const session = event.data?.object || {};
+    const md = session.metadata || {};
 
-      // ✅ Prefer flat metadata; only parse payload if present
-      let meta = session?.metadata || {};
-      if (meta && typeof meta.payload === 'string' && meta.payload.trim()) {
-        try { meta = JSON.parse(meta.payload); } catch { /* keep flat */ }
-      }
+    // Required for /api/create-event.js
+    const payload = {
+      // required
+      startISO: String(md.startISO || ''),
+      pkg: String(md.pkg || ''),
+      mainBar: String(md.mainBar || ''),
+      fullName: String(md.fullName || ''),
+      // optional
+      email: String(md.email || ''),
+      phone: String(md.phone || ''),
+      venue: String(md.venue || ''),
+      dateISO: String(md.dateISO || ''),
+      affiliateName: String(md.affiliateName || ''),
+      affiliateEmail: String(md.affiliateEmail || ''),
+      pin: String(md.pin || ''),
+      // flags (optional)
+      secondEnabled: md.secondEnabled === 'true',
+      secondBar: String(md.secondBar || ''),
+      secondSize: String(md.secondSize || ''),
+      fountainEnabled: md.fountainEnabled === 'true',
+      fountainSize: String(md.fountainSize || ''),
+      fountainType: String(md.fountainType || ''),
+      notes: String(md.notes || ''),
+    };
 
-      if (session.payment_status === 'paid') {
-        const resp = await fetch(`${process.env.PUBLIC_URL || 'https://manna-affiliate.vercel.app'}/api/create-event`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            // essentials
-            pin: meta.pin || '',
-            affiliateName: meta.affiliateName || '',
-            affiliateEmail: meta.affiliateEmail || '',
-            fullName: meta.fullName || '',
-            email: meta.email || '',
-            phone: meta.phone || '',
-            venue: meta.venue || '',
-            pkg: meta.pkg || '',
-            mainBar: meta.mainBar || '',
-            secondEnabled: meta.secondEnabled === 'true' || meta.secondEnabled === true,
-            secondBar: meta.secondBar || '',
-            secondSize: meta.secondSize || '',
-            fountainEnabled: meta.fountainEnabled === 'true' || meta.fountainEnabled === true,
-            fountainSize: meta.fountainSize || '',
-            fountainType: meta.fountainType || '',
-            dateISO: meta.dateISO || '',
-            startISO: meta.startISO || '',
-            notes: (meta.notes || `Stripe ${session.id}`),
-            total: Number(meta.total || 0),
-            deposit: Number(meta.deposit || 0),
-            balance: Number(meta.balance || 0),
-            addGuests: true
-          })
-        });
+    // Validate required fields (this is what caused the 400 before)
+    const missing = [];
+    if (!payload.startISO) missing.push('startISO');
+    if (!payload.pkg) missing.push('pkg');
+    if (!payload.mainBar) missing.push('mainBar');
+    if (!payload.fullName) missing.push('fullName');
 
-        // Better error surface back to Stripe logs
-        const text = await resp.text();
-        if (!resp.ok) {
-          console.error('create-event failed', resp.status, text);
-          return res.status(500).json({ ok:false, error:'create_event_failed', detail:`HTTP ${resp.status}`, body:text });
-        }
-      }
+    if (missing.length) {
+      console.error('create-event missing fields:', missing);
+      return json(res, 400, {
+        ok: false,
+        error: 'missing_fields',
+        missing,
+      });
     }
 
-    return res.status(200).json({ ok:true });
+    const BASE =
+      process.env.PUBLIC_URL ||
+      'https://manna-affiliate.vercel.app';
+
+    // Call your own API to reuse the calendar-creation logic
+    const rsp = await fetch(`${BASE}/api/create-event`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+
+    const j = await rsp.json().catch(() => ({}));
+    if (!rsp.ok || !j.ok) {
+      console.error('create-event failed from webhook:', rsp.status, j);
+      return json(res, 500, {
+        ok: false,
+        error: 'create_event_failed',
+        detail: `HTTP ${rsp.status}`,
+        body: j?.error || j,
+      });
+    }
+
+    return json(res, 200, { ok: true, createdEventId: j.eventId || null });
   } catch (e) {
-    console.error('webhook handler error', e);
-    return res.status(500).json({ ok:false, error:'handler_exception', detail:String(e?.message || e) });
+    console.error('webhook handler error:', e);
+    return json(res, 500, { ok: false, error: 'server_error' });
   }
 }

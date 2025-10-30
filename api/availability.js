@@ -2,195 +2,155 @@
 export const config = { runtime: 'nodejs' };
 
 /**
- * Env you can set:
- * - TIMEZONE            (default: America/Los_Angeles)
- * - GOOGLE_SERVICE_ACCOUNT_JSON  (or GCP_CLIENT_EMAIL + GCP_PRIVATE_KEY)
- * - CALENDAR_ID         (default: primary)
- * - ALLOWED_ORIGINS     (comma-separated list; * if unset)
+ * Business rules
+ * - Service start times offered hourly from START_HOUR .. END_HOUR (inclusive)
+ * - Full block checked per slot = 1h prep + live service + 1h clean
+ * - Max 2 overlapping events per slot (concurrency = 2)
+ * - Max 3 events per day (hard cap)
  */
+const START_HOUR = 7;     // 7:00 AM
+const END_HOUR   = 22;    // 10:00 PM (latest *start* we’ll consider, see lastStart logic)
+const PREP_HOURS   = 1;
+const CLEAN_HOURS  = 1;
+const MAX_CONCURRENT = 2; // “2 events Max Per Sample Time”
+const MAX_PER_DAY    = 3; // “3 Events Max per day”
 
-const BUSINESS_TZ = process.env.TIMEZONE || 'America/Los_Angeles';
-const OPEN_HOUR = 9;   // 09:00 local
-const CLOSE_HOUR = 22; // 22:00 local (last allowed start)
-const MAX_CONCURRENT = 2; // max bars running at once
-const MAX_PER_DAY = 3;    // max bars per day (any time)
-
-/** Map package => service hours */
-function serviceHoursFromPkg(pkg) {
-  if (pkg === '50-150-5h') return 2;
-  if (pkg === '150-250-5h') return 2.5;
-  if (pkg === '250-350-6h') return 3;
-  return 2; // default
+// ---- tiny helpers ----
+function tzStartISO(ymd, hour, tz) {
+  // build exact local time in tz and convert to ISO
+  const [y, m, d] = ymd.split('-').map(Number);
+  // start with naive UTC guess, then correct using tz offset at that instant
+  const guessUTC = Date.UTC(y, m - 1, d, hour, 0, 0);
+  const asDate = new Date(guessUTC);
+  const local = new Date(asDate.toLocaleString('en-US', { timeZone: tz }));
+  const offset = local.getTime() - asDate.getTime(); // tz offset in ms at that moment
+  return new Date(guessUTC - offset).toISOString();  // true instant as ISO
 }
 
-/** Build a Date for a wall-clock time in a given IANA TZ, then return ISO in UTC */
-function zonedISO(yyyy_MM_dd, hour = 0, minute = 0, tz = BUSINESS_TZ) {
-  const [y, m, d] = yyyy_MM_dd.split('-').map(Number);
-  // Create a "guessed" UTC moment for that local time…
-  const guessUtc = new Date(Date.UTC(y, m - 1, d, hour, minute, 0, 0));
-  // Get what that UTC moment looks like in the target tz
-  const inTz = new Date(guessUtc.toLocaleString('en-US', { timeZone: tz }));
-  // Offset difference between local tz and the simple UTC guess
-  const offsetMs = inTz.getTime() - guessUtc.getTime();
-  // Corrected UTC timestamp that corresponds to local tz wall-clock time
-  return new Date(guessUtc.getTime() - offsetMs).toISOString();
+function toDate(x) {
+  return new Date(x?.dateTime || x?.date || x);
 }
 
-/** Add hours to a Date (ms-based) */
-function addHours(date, hours) {
-  return new Date(date.getTime() + hours * 3600e3);
-}
-
-/** Overlap check: [aStart,aEnd) vs [bStart,bEnd) */
 function overlaps(aStart, aEnd, bStart, bEnd) {
+  // (a starts before b ends) && (a ends after b starts)
   return aStart < bEnd && aEnd > bStart;
 }
 
-/** Generate 30-min step start times from OPEN_HOUR..CLOSE_HOUR inclusive */
-function* generateStartTimes(yyyy_MM_dd) {
-  // start-of-day in local tz 00:00 for boundary checks
-  const dayStartISO = zonedISO(yyyy_MM_dd, 0, 0, BUSINESS_TZ);
-  const dayStart = new Date(dayStartISO);
-  const lastStartISO = zonedISO(yyyy_MM_dd, CLOSE_HOUR, 0, BUSINESS_TZ);
-  const lastStart = new Date(lastStartISO);
+export default async function handler(req, res) {
+  // ----- CORS (simple allowlist) -----
+  const allow = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
+  const origin = req.headers.origin || '';
+  const okOrigin = allow.length ? allow.includes(origin) : true;
 
-  for (let h = OPEN_HOUR; h <= CLOSE_HOUR; h++) {
-    for (let m = 0; m < 60; m += 30) {
-      const startISO = zonedISO(yyyy_MM_dd, h, m, BUSINESS_TZ);
-      const start = new Date(startISO);
-      if (start > lastStart) continue; // just in case (minute loop)
-      yield start;
-    }
+  if (req.method === 'OPTIONS') {
+    res.setHeader('Access-Control-Allow-Origin', okOrigin ? origin : '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    res.setHeader('Vary', 'Origin');
+    return res.status(204).end();
   }
-}
-
-/** Soft Google Calendar loader; returns [] if not configured/available */
-async function listEventsForDay(yyyy_MM_dd) {
-  // Figure day bounds in local tz
-  const timeMin = zonedISO(yyyy_MM_dd, 0, 0, BUSINESS_TZ);
-  const timeMax = zonedISO(yyyy_MM_dd, 23, 59, BUSINESS_TZ);
-  const calendarId = process.env.CALENDAR_ID || 'primary';
+  res.setHeader('Access-Control-Allow-Origin', okOrigin ? origin : '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Vary', 'Origin');
 
   try {
+    const { date, hours } = req.query || {};
+    if (!date) return res.status(400).json({ ok: false, error: 'Missing date (YYYY-MM-DD)' });
+
+    // live service hours for the selected package: 2, 2.5, or 3
+    const LIVE_HOURS = Math.max(1, parseFloat(String(hours || '2')));
+
+    const TIMEZONE   = process.env.TIMEZONE || 'America/Los_Angeles';
+    const CALENDAR_ID = process.env.CALENDAR_ID || process.env.GOOGLE_CALENDAR_ID || 'primary';
+
+    // ---- Google Calendar client (service account) ----
     const { google } = await import('googleapis');
     let clientEmail, privateKey;
 
     if (process.env.GOOGLE_SERVICE_ACCOUNT_JSON) {
       const sa = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
       clientEmail = sa.client_email;
-      privateKey = (sa.private_key || '').replace(/\\n/g, '\n');
+      privateKey  = (sa.private_key || '').replace(/\\n/g, '\n');
     } else {
       clientEmail = process.env.GCP_CLIENT_EMAIL;
-      privateKey = (process.env.GCP_PRIVATE_KEY || '').replace(/\\n/g, '\n');
+      privateKey  = (process.env.GCP_PRIVATE_KEY || '').replace(/\\n/g, '\n');
     }
-    if (!clientEmail || !privateKey) return []; // not configured
 
-    const jwt = new google.auth.JWT(
+    if (!clientEmail || !privateKey) {
+      return res.status(500).json({ ok: false, error: 'Missing Google service account envs' });
+    }
+
+    const auth = new google.auth.JWT(
       clientEmail,
       null,
       privateKey,
       ['https://www.googleapis.com/auth/calendar']
     );
-    const calendar = google.calendar({ version: 'v3', auth: jwt });
+    const calendar = google.calendar({ version: 'v3', auth });
 
-    const rsp = await calendar.events.list({
-      calendarId,
-      timeMin,
-      timeMax,
+    // Pull all events for the day (local day bounds in TIMEZONE)
+    const dayMin = tzStartISO(date, 0, TIMEZONE);
+    const dayMax = tzStartISO(date, 23, TIMEZONE);
+
+    const list = await calendar.events.list({
+      calendarId: CALENDAR_ID,
+      timeMin: dayMin,
+      timeMax: dayMax,
       singleEvents: true,
       orderBy: 'startTime',
-      maxResults: 2500,
+      maxResults: 250
     });
 
-    const items = (rsp.data.items || []).filter(e => e.status !== 'cancelled');
+    const events = (list.data.items || [])
+      .filter(e => e.status !== 'cancelled')
+      .map(e => ({
+        id: e.id,
+        start: toDate(e.start),
+        end:   toDate(e.end),
+      }));
 
-    // Normalize to concrete Date ranges
-    return items.map(e => {
-      const s = e.start?.dateTime || e.start?.date; // all-day events have 'date'
-      const e_ = e.end?.dateTime || e.end?.date;
-      const start = new Date(s);
-      const end = new Date(e_);
-      return { start, end };
-    });
-  } catch {
-    // any error => treat as no events
-    return [];
-  }
-}
-
-/** CORS */
-function setCors(req, res) {
-  const allow = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
-  const origin = req.headers.origin || '';
-  const okOrigin = allow.length ? allow.includes(origin) : true;
-
-  res.setHeader('Access-Control-Allow-Origin', okOrigin ? origin : '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-  res.setHeader('Vary', 'Origin');
-}
-
-export default async function handler(req, res) {
-  setCors(req, res);
-  if (req.method === 'OPTIONS') return res.status(204).end();
-  if (req.method !== 'GET') return res.status(405).json({ ok: false, error: 'Method not allowed' });
-
-  try {
-    const { date, pkg, hours } = req.query || {};
-    if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
-      return res.status(400).json({ ok: false, error: 'Missing or invalid ?date=YYYY-MM-DD' });
-    }
-
-    // Accept either pkg or hours
-    let liveHours = Number(hours);
-    if (!liveHours || Number.isNaN(liveHours)) {
-      liveHours = serviceHoursFromPkg(String(pkg || '').trim());
-    }
-    // Full block = 1h buffer + live + 1h cleanup
-    const blockHours = 1 + liveHours + 1;
-
-    // Fetch all existing events for that day (or [] if not configured)
-    const events = await listEventsForDay(date);
-
-    // Hard daily cap
+    // ----- Per-day cap -----
     if (events.length >= MAX_PER_DAY) {
       return res.status(200).json({ ok: true, slots: [] });
     }
 
+    // Generate hourly candidates in local time
+    const slots = [];
     const now = new Date();
-    const dayEnd = new Date(zonedISO(date, 23, 59, BUSINESS_TZ));
-    const out = [];
 
-    for (const start of generateStartTimes(date)) {
-      // Skip past starts for today
+    // Choose a safe last start so that service+clean doesn’t run absurdly late.
+    // We allow cleanup to cross midnight, but if you want to forbid that,
+    // uncomment the clamp below.
+    // const LAST_START = Math.min(END_HOUR, 24 - Math.ceil(LIVE_HOURS + CLEAN_HOURS));
+
+    const LAST_START = END_HOUR;
+
+    for (let H = START_HOUR; H <= LAST_START; H++) {
+      const startISO = tzStartISO(date, H, TIMEZONE);
+      const start = new Date(startISO);
+
+      // Skip past times (today)
       if (start < now) continue;
 
-      const blockStart = addHours(start, -1); // 1h buffer
-      const blockEnd = addHours(start, blockHours - 1); // already subtracted 1h above
+      // Full operational block we must keep free around that start
+      const blockStart = new Date(start.getTime() - PREP_HOURS * 3600e3);
+      const blockEnd   = new Date(start.getTime() + (LIVE_HOURS + CLEAN_HOURS) * 3600e3);
 
-      // Keep entire block within the same local day
-      if (blockEnd > dayEnd) continue;
-
-      // Count overlaps with existing events
+      // Count how many existing events overlap this block
       let concurrent = 0;
       for (const ev of events) {
-        if (overlaps(blockStart, blockEnd, ev.start, ev.end)) {
-          concurrent++;
-          if (concurrent >= MAX_CONCURRENT) break;
-        }
+        if (overlaps(blockStart, blockEnd, ev.start, ev.end)) concurrent++;
       }
-      if (concurrent >= MAX_CONCURRENT) continue;
 
-      // If we added this, would it break the daily cap?
-      if (events.length + out.length + 1 > MAX_PER_DAY) continue;
-
-      out.push({ startISO: start.toISOString(), endISO: blockEnd.toISOString() });
+      if (concurrent < MAX_CONCURRENT) {
+        slots.push({ startISO: start.toISOString() });
+      }
     }
 
-    return res.status(200).json({ ok: true, slots: out });
+    return res.status(200).json({ ok: true, slots });
   } catch (e) {
     console.error('availability error', e);
-    // Fail soft: return ok with empty slots to avoid frontend error banners
-    return res.status(200).json({ ok: true, slots: [], error: 'availability_failed' });
+    return res.status(500).json({ ok: false, error: 'availability_failed', detail: e.message });
   }
 }

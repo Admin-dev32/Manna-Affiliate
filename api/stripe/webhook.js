@@ -1,11 +1,24 @@
 // /api/stripe/webhook.js
-import { applyCors, preflight } from '../_cors.js';
-import Stripe from 'stripe';
+export const config = {
+  runtime: 'nodejs',
+  api: { bodyParser: false }, // IMPORTANT: raw body for Stripe signature
+};
 
-export const config = { api: { bodyParser: false } };
+import { createCalendarEvent } from '../create-event.js';
 
-function buffer(req) {
-  return new Promise((resolve, reject) => {
+// Lazy Stripe init
+const stripe = (() => {
+  const key = process.env.STRIPE_SECRET_KEY;
+  if (!key) throw new Error('Missing STRIPE_SECRET_KEY');
+  // eslint-disable-next-line global-require
+  return require('stripe')(key, { apiVersion: '2023-10-16' });
+})();
+
+const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET;
+
+// Read raw body without extra deps
+async function readRawBody(req) {
+  return await new Promise((resolve, reject) => {
     const chunks = [];
     req.on('data', (c) => chunks.push(c));
     req.on('end', () => resolve(Buffer.concat(chunks)));
@@ -14,35 +27,63 @@ function buffer(req) {
 }
 
 export default async function handler(req, res) {
-  if (preflight(req, res)) return; // harmless for browsers; Stripe won’t send OPTIONS
-  applyCors(res);
+  if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
+  if (!endpointSecret) {
+    console.error('Missing STRIPE_WEBHOOK_SECRET');
+    return res.status(500).send('Server misconfigured');
+  }
 
-  if (req.method !== 'POST') {
-    return res.status(405).json({ ok: false, error: 'Method not allowed' });
+  let event;
+  try {
+    const buf = await readRawBody(req);
+    const sig = req.headers['stripe-signature'];
+    event = stripe.webhooks.constructEvent(buf, sig, endpointSecret);
+  } catch (err) {
+    console.error('Stripe signature verification failed:', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
   try {
-    const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: '2023-10-16' });
-    const sig = req.headers['stripe-signature'];
-    const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET;
-    const buf = await buffer(req);
-
-    let event;
-    if (endpointSecret) {
-      event = stripe.webhooks.constructEvent(buf, sig, endpointSecret);
-    } else {
-      event = JSON.parse(buf.toString()); // not recommended, but avoids crash if secret missing
-    }
-
     if (event.type === 'checkout.session.completed') {
       const session = event.data.object;
-      console.log('Checkout complete:', session.id, session.metadata);
-      // TODO: persist payment, notify, etc.
+
+      // Metadata set by /api/create-checkout
+      const m = session.metadata || {};
+      const payload = {
+        fullName: m.fullName || '',
+        email: m.email || '',
+        phone: m.phone || '',
+        venue: m.venue || '',
+        startISO: m.startISO || '',
+        pkg: m.pkg || '',
+        mainBar: m.mainBar || '',
+        secondEnabled: m.secondEnabled === 'true',
+        secondBar: m.secondBar || '',
+        secondSize: m.secondSize || '',
+        fountainEnabled: m.fountainEnabled === 'true',
+        fountainSize: m.fountainSize || '',
+        fountainType: m.fountainType || '',
+        notes: m.notes || '',
+        total: Number(m.total || 0),
+        deposit: Number(m.deposit || 0),
+        balance: Number(m.balance || 0),
+        payMode: m.payMode || 'deposit',
+        affiliateName: m.affName || '',
+        affiliateEmail: m.affEmail || '',
+        noDeposit: false, // paid via Stripe
+      };
+
+      try {
+        const ev = await createCalendarEvent(payload);
+        console.log('✅ Calendar event created from webhook:', ev?.id);
+      } catch (e) {
+        console.error('❌ Failed to create calendar event from webhook:', e);
+      }
     }
 
-    res.status(200).json({ received: true });
+    return res.json({ received: true });
   } catch (e) {
-    console.error('Webhook error', e);
-    res.status(400).json({ ok: false, error: e.message || 'Webhook error' });
+    console.error('Webhook handler error', e);
+    return res.status(500).json({ ok: false });
   }
 }

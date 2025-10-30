@@ -1,96 +1,123 @@
 // /api/create-checkout.js
 export const config = { runtime: 'nodejs' };
 
-import { applyCors, preflight } from './_cors.js';
+import Stripe from 'stripe';
+import { applyCors, handlePreflight } from './_cors.js';
 
-const stripe = (() => {
-  const key = process.env.STRIPE_SECRET_KEY;
-  if (!key) throw new Error('Missing STRIPE_SECRET_KEY');
-  // eslint-disable-next-line global-require
-  return require('stripe')(key, { apiVersion: '2023-10-16' });
-})();
-
-function moneyToCents(n) { return Math.round((Number(n) || 0) * 100); }
-
-// keep metadata small (500 chars limit). We only keep essentials here.
-function packMeta(data) {
-  const keep = {
-    fullName: data.fullName || '',
-    email: data.email || '',
-    phone: data.phone || '',
-    venue: data.venue || '',
-    startISO: data.startISO || '',
-    pkg: data.pkg || '',
-    mainBar: data.mainBar || '',
-    secondEnabled: !!data.secondEnabled,
-    secondBar: data.secondBar || '',
-    secondSize: data.secondSize || '',
-    fountainEnabled: !!data.fountainEnabled,
-    fountainSize: data.fountainSize || '',
-    fountainType: data.fountainType || '',
-    notes: (data.notes || '').slice(0, 200), // trim
-    total: String(data.total || 0),
-    deposit: String(data.deposit || 0),
-    balance: String(data.balance || 0),
-    payMode: data.payMode || 'deposit',
-    affName: data.affiliateName || '',
-    affEmail: data.affiliateEmail || '',
-  };
-  // flatten to metadata key/values
-  return Object.fromEntries(Object.entries(keep).map(([k,v])=>[k, String(v)]));
+function bad(res, msg, extra = {}) {
+  return res.status(400).json({ ok: false, error: msg, ...extra });
 }
 
 export default async function handler(req, res) {
+  // CORS
+  if (handlePreflight(req, res)) return;
+  applyCors(req, res);
+
+  if (req.method !== 'POST') {
+    return res.status(405).json({ ok: false, error: 'method_not_allowed' });
+  }
+
   try {
-    if (preflight(req, res)) return;
-    applyCors(res);
+    const {
+      fullName, email, phone, venue,
+      dateISO, startISO, // we use startISO as the actual start time
+      pkg, mainBar,
+      secondEnabled, secondBar, secondSize,
+      fountainEnabled, fountainSize, fountainType,
+      discountMode, discountValue,
+      payMode, deposit, total, balance,
+      affiliateName, affiliateEmail, pin, notes
+    } = req.body || {};
 
-    if (req.method !== 'POST') {
-      return res.status(405).json({ ok:false, error: 'Method not allowed' });
+    // Basic validation
+    if (!pin) return bad(res, 'missing_pin');
+    if (!startISO) return bad(res, 'missing_startISO');
+    if (!pkg) return bad(res, 'missing_pkg');
+    if (typeof total !== 'number') return bad(res, 'missing_total_number');
+    if (typeof balance !== 'number') return bad(res, 'missing_balance_number');
+
+    const stripeKey = process.env.STRIPE_SECRET_KEY;
+    if (!stripeKey) return bad(res, 'missing_STRIPE_SECRET_KEY');
+
+    const stripe = new Stripe(stripeKey, { apiVersion: '2024-06-20' });
+
+    // Decide what the customer will pay on Checkout
+    // - If payMode === 'full', charge `total - 20` (your $20 flat off)
+    // - Else charge `deposit` (if provided), otherwise default to $50 deposit
+    let amountToCharge = 0;
+    if (payMode === 'full') {
+      amountToCharge = Math.max(0, Math.round((total - 20) * 100));
+    } else {
+      const dep = (typeof deposit === 'number' && deposit > 0) ? deposit : 50;
+      amountToCharge = Math.max(0, Math.round(dep * 100));
     }
+    if (!amountToCharge) return bad(res, 'invalid_amount');
 
-    const data = req.body || {};
-    if (!data.startISO) {
-      return res.status(400).json({ ok:false, error: 'Missing startISO (select a slot)' });
-    }
-    if (!data.fullName) {
-      return res.status(400).json({ ok:false, error: 'Missing client name' });
-    }
+    // Line item title (show enough info for you + the client)
+    const title = `Manna Snack Bars — ${mainBar || 'Package'} (${pkg})`;
+    const whenLabel = new Date(startISO).toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short', timeZone: 'America/Los_Angeles' });
 
-    // amount: deposit vs full (-$20 already handled client-side)
-    const amount = data.payMode === 'full' ? Number(data.total||0) : Number(data.deposit||0);
-    if (amount <= 0) {
-      return res.status(400).json({ ok:false, error: 'Amount must be greater than 0' });
-    }
+    // Build metadata so the webhook can create the calendar event reliably
+    const metadata = {
+      fullName: String(fullName || ''),
+      email: String(email || ''),
+      phone: String(phone || ''),
+      venue: String(venue || ''),
+      dateISO: String(dateISO || startISO.slice(0, 10)),
+      startISO: String(startISO),
+      pkg: String(pkg || ''),
+      mainBar: String(mainBar || ''),
+      secondEnabled: String(!!secondEnabled),
+      secondBar: String(secondBar || ''),
+      secondSize: String(secondSize || ''),
+      fountainEnabled: String(!!fountainEnabled),
+      fountainSize: String(fountainSize || ''),
+      fountainType: String(fountainType || ''),
+      discountMode: String(discountMode || 'none'),
+      discountValue: String(discountValue ?? ''),
+      payMode: String(payMode || 'deposit'),
+      total: String(total),
+      deposit: String(deposit ?? ''),
+      balance: String(balance),
+      affiliateName: String(affiliateName || ''),
+      affiliateEmail: String(affiliateEmail || ''),
+      pin: String(pin || ''),
+      notes: String(notes || ''),
+      // marker for your webhook
+      manna_checkout: '1'
+    };
 
-    const site = process.env.PUBLIC_URL || 'https://mannasnackbars.com';
-    const success = `${site.replace(/\/$/,'')}/thankyou?sid={CHECKOUT_SESSION_ID}`;
-    const cancel  = `${site.replace(/\/$/,'')}/affiliated-booking`;
+    // Success/Cancel URLs (open outside iframe)
+    const successUrl = process.env.CHECKOUT_SUCCESS_URL || 'https://mannasnackbars.com/thankyou';
+    const cancelUrl  = process.env.CHECKOUT_CANCEL_URL  || 'https://mannasnackbars.com/';
 
-    const description = `Manna Snack Bars — ${data.mainBar || 'Package'} — ${data.fullName}`;
     const session = await stripe.checkout.sessions.create({
       mode: 'payment',
-      line_items: [{
-        price_data: {
-          currency: 'usd',
-          product_data: {
-            name: data.payMode === 'full' ? 'Full payment' : 'Booking deposit',
-            description,
+      payment_method_types: ['card'],
+      line_items: [
+        {
+          price_data: {
+            currency: 'usd',
+            unit_amount: amountToCharge,
+            product_data: {
+              name: title,
+              description: `Event: ${whenLabel} — ${venue || 'TBD'}`
+            }
           },
-          unit_amount: moneyToCents(amount),
-        },
-        quantity: 1,
-      }],
-      success_url: success,
-      cancel_url: cancel,
-      client_reference_id: `${Date.now()}-${Math.random().toString(16).slice(2,8)}`,
-      customer_email: (data.email || undefined),
-      metadata: packMeta(data),
+          quantity: 1
+        }
+      ],
+      customer_email: email || undefined,
+      metadata,
+      success_url: successUrl + '?session_id={CHECKOUT_SESSION_ID}',
+      cancel_url: cancelUrl,
     });
 
-    return res.status(200).json({ ok:true, url: session.url });
+    // return JSON with url for the client to redirect (window.top.location.assign)
+    return res.status(200).json({ ok: true, url: session.url });
   } catch (e) {
     console.error('create-checkout error', e);
-    return res.status(500).json({ ok:false, error: e.message || 'create_checkout_failed' });
+    // Ensure we ALWAYS return JSON so the frontend .json() doesn’t explode
+    return res.status(500).json({ ok: false, error: 'create_checkout_failed', detail: e.message });
   }
 }

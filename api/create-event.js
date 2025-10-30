@@ -1,12 +1,12 @@
 // /api/create-event.js
 export const config = { runtime: 'nodejs' };
 
-import { applyCors, preflight } from './_cors.js';
+import { applyCors, handlePreflight } from './_cors.js';
 import { getOAuthCalendar } from './_google.js';
 import { resolveAffiliate } from './_affiliates.js';
 
 const TZ = process.env.TIMEZONE || 'America/Los_Angeles';
-const CAL_ID = process.env.CALENDAR_ID || 'primary';
+const CAL_ID = process.env.CALENDAR_ID || process.env.GOOGLE_CALENDAR_ID || 'primary';
 
 const s = (v, fb='') => (typeof v === 'string' ? v : fb).trim();
 
@@ -33,7 +33,6 @@ function serviceHours(pkg){
   return 2;
 }
 function opWindow(startISO, pkg){
-  // Ventana operacional: 1h prep antes + servicio + 1h limpieza
   const PREP = 1, CLEAN = 1;
   const live = serviceHours(pkg);
   const start = new Date(startISO);
@@ -41,8 +40,8 @@ function opWindow(startISO, pkg){
   const opEnd   = new Date(start.getTime() + (live + CLEAN) * 3600_000);
   return { opStartISO: opStart.toISOString(), opEndISO: opEnd.toISOString() };
 }
-function dayRange(dateISO){
-  const d = new Date(dateISO);
+function dayRange(startISO){
+  const d = new Date(startISO);
   const start = new Date(d.getFullYear(), d.getMonth(), d.getDate());
   const end = new Date(start.getTime() + 24*3600_000);
   return { dayStartISO: start.toISOString(), dayEndISO: end.toISOString() };
@@ -50,25 +49,12 @@ function dayRange(dateISO){
 
 export default async function handler(req, res){
   // CORS
-  const allow = (process.env.ALLOWED_ORIGINS || '').split(',').map(x=>x.trim()).filter(Boolean);
-  const origin = req.headers.origin || '';
-  const okOrigin = allow.length ? allow.includes(origin) : true;
+  if (handlePreflight(req, res)) return;
+  applyCors(req, res);
 
-  if (req.method === 'OPTIONS'){
-    res.setHeader('Access-Control-Allow-Origin', okOrigin ? origin : '*');
-    res.setHeader('Access-Control-Allow-Methods', 'POST,OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-    res.setHeader('Vary', 'Origin');
-    return res.status(204).end();
+  if (req.method !== 'POST') {
+    return res.status(405).json({ ok:false, error:'method_not_allowed' });
   }
-  res.setHeader('Access-Control-Allow-Origin', okOrigin ? origin : '*');
-  res.setHeader('Access-Control-Allow-Methods', 'POST,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-  res.setHeader('Vary', 'Origin');
-  if (preflight(req, res)) return;
-  applyCors(res);
-
-  if (req.method !== 'POST') return res.status(405).json({ ok:false, error:'method_not_allowed' });
 
   try{
     const body = req.body || {};
@@ -82,7 +68,6 @@ export default async function handler(req, res){
     const fullName  = s(body.fullName);
     const venue     = s(body.venue);
     const notes     = s(body.notes);
-    const dateISO   = s(body.dateISO) || startISO;
 
     if (!startISO || !pkg || !mainBar || !fullName){
       return res.status(400).json({ ok:false, error:'missing_fields' });
@@ -90,10 +75,10 @@ export default async function handler(req, res){
 
     const { opStartISO, opEndISO } = opWindow(startISO, pkg);
 
-    // === Reglas de capacidad ===
-    const calendar = await getOAuthCalendar();
+    // ✅ Calendar client (destructure)
+    const { calendar } = await getOAuthCalendar();
 
-    // 1) Max 3 eventos por día (contando cualquiera que caiga en ese día)
+    // 1) Max 3 events per day
     const { dayStartISO, dayEndISO } = dayRange(startISO);
     const dayList = await calendar.events.list({
       calendarId: CAL_ID,
@@ -107,7 +92,7 @@ export default async function handler(req, res){
       return res.status(409).json({ ok:false, error:'capacity_day_limit', detail:'Max 3 events per day reached.' });
     }
 
-    // 2) Max 2 eventos superpuestos dentro de la ventana operacional (prep + servicio + limpieza)
+    // 2) Max 2 overlapping in operational window
     const overlapList = await calendar.events.list({
       calendarId: CAL_ID,
       timeMin: opStartISO,
@@ -119,14 +104,13 @@ export default async function handler(req, res){
       const evStart = ev.start?.dateTime || ev.start?.date;
       const evEnd   = ev.end?.dateTime   || ev.end?.date;
       if (!evStart || !evEnd) return false;
-      // si se tocan se consideran solapados (ventana cerrada)
       return !(new Date(evEnd) <= new Date(opStartISO) || new Date(evStart) >= new Date(opEndISO));
     }).length;
     if (overlapping >= 2){
       return res.status(409).json({ ok:false, error:'capacity_overlap_limit', detail:'Max 2 concurrent events in the operational window.' });
     }
 
-    // ===== Crear evento (con invitados) =====
+    // Build attendees
     const attendees = [];
     const clientEmail    = s(body.email);
     const affiliateEmail = s(body.affiliateEmail);

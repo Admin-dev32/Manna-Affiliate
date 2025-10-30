@@ -8,6 +8,10 @@ import { resolveAffiliate } from './_affiliates.js';
 const TZ = process.env.TIMEZONE || 'America/Los_Angeles';
 const CAL_ID = process.env.CALENDAR_ID || process.env.GOOGLE_CALENDAR_ID || 'primary';
 
+const HOURS_RANGE = { start: 9, end: 22 }; // 9:00 → 22:00 local wall time
+const MAX_PER_SLOT = 2;                    // max concurrent within op window
+const MAX_PER_DAY  = 3;                    // max per calendar day
+
 const s = (v, fb='') => (typeof v === 'string' ? v : fb).trim();
 
 function pkgLabel(v){
@@ -46,15 +50,26 @@ function dayRange(startISO){
   const end = new Date(start.getTime() + 24*3600_000);
   return { dayStartISO: start.toISOString(), dayEndISO: end.toISOString() };
 }
+function localHour(iso, tz){
+  const dt = new Date(iso);
+  const parts = new Intl.DateTimeFormat('en-US',{
+    timeZone: tz, hour:'2-digit', hour12:false
+  }).formatToParts(dt);
+  const hh = Number(parts.find(p=>p.type==='hour')?.value || '0');
+  return hh;
+}
+function assertWithinHours(startISO, tz){
+  const hh = localHour(startISO, tz);
+  if (hh < HOURS_RANGE.start || hh > HOURS_RANGE.end){
+    const msg = `outside_business_hours: ${hh}:00 not in ${HOURS_RANGE.start}:00–${HOURS_RANGE.end}:00 ${tz}`;
+    const e = new Error(msg); e.status = 409; throw e;
+  }
+}
 
 export default async function handler(req, res){
-  // CORS
   if (handlePreflight(req, res)) return;
   applyCors(req, res);
-
-  if (req.method !== 'POST') {
-    return res.status(405).json({ ok:false, error:'method_not_allowed' });
-  }
+  if (req.method !== 'POST') return res.status(405).json({ ok:false, error:'method_not_allowed' });
 
   try{
     const body = req.body || {};
@@ -73,12 +88,13 @@ export default async function handler(req, res){
       return res.status(400).json({ ok:false, error:'missing_fields' });
     }
 
-    const { opStartISO, opEndISO } = opWindow(startISO, pkg);
+    // ✅ Enforce 9:00–22:00 local
+    assertWithinHours(startISO, TZ);
 
-    // ✅ Calendar client (destructure)
+    const { opStartISO, opEndISO } = opWindow(startISO, pkg);
     const { calendar } = await getOAuthCalendar();
 
-    // 1) Max 3 events per day
+    // 1) Max 3 events/day
     const { dayStartISO, dayEndISO } = dayRange(startISO);
     const dayList = await calendar.events.list({
       calendarId: CAL_ID,
@@ -87,12 +103,12 @@ export default async function handler(req, res){
       singleEvents: true,
       orderBy: 'startTime'
     });
-    const dayCount = (dayList.data.items || []).length;
-    if (dayCount >= 3){
+    const dayCount = (dayList.data.items || []).filter(e => e.status !== 'cancelled').length;
+    if (dayCount >= MAX_PER_DAY){
       return res.status(409).json({ ok:false, error:'capacity_day_limit', detail:'Max 3 events per day reached.' });
     }
 
-    // 2) Max 2 overlapping in operational window
+    // 2) Max 2 overlapping within op window
     const overlapList = await calendar.events.list({
       calendarId: CAL_ID,
       timeMin: opStartISO,
@@ -101,12 +117,13 @@ export default async function handler(req, res){
       orderBy: 'startTime'
     });
     const overlapping = (overlapList.data.items || []).filter(ev=>{
+      if (ev.status === 'cancelled') return false;
       const evStart = ev.start?.dateTime || ev.start?.date;
       const evEnd   = ev.end?.dateTime   || ev.end?.date;
       if (!evStart || !evEnd) return false;
       return !(new Date(evEnd) <= new Date(opStartISO) || new Date(evStart) >= new Date(opEndISO));
     }).length;
-    if (overlapping >= 2){
+    if (overlapping >= MAX_PER_SLOT){
       return res.status(409).json({ ok:false, error:'capacity_overlap_limit', detail:'Max 2 concurrent events in the operational window.' });
     }
 
@@ -153,8 +170,9 @@ export default async function handler(req, res){
 
     return res.status(200).json({ ok:true, eventId: rsp.data?.id || null });
   } catch (e){
+    const status = e.status || 500;
     const detail = e?.response?.data || e?.message || String(e);
     console.error('[create-event] error', detail);
-    return res.status(500).json({ ok:false, error:'create_event_failed', detail });
+    return res.status(status).json({ ok:false, error:'create_event_failed', detail });
   }
 }

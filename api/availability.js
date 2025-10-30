@@ -1,15 +1,15 @@
 // /api/availability.js
 export const config = { runtime: 'nodejs' };
 
-import { applyCors, preflight } from './_cors.js';
+import { applyCors, handlePreflight } from './_cors.js';
 import { getOAuthCalendar } from './_google.js';
 
 // Business rules
-const HOURS_RANGE = { start: 9, end: 22 }; // 09:00 → 22:00 candidate starts (local time)
+const HOURS_RANGE = { start: 9, end: 22 }; // 09:00 → 22:00 candidate starts (local)
 const PREP_HOURS  = 1;                     // 1h before
 const CLEAN_HOURS = 1;                     // 1h after
 const MAX_PER_SLOT = 2;                    // max 2 events colliding the full service block
-const MAX_PER_DAY  = 3;                    // max 3 events per calendar day
+const MAX_PER_DAY  = 3;                    // max 3 events per day
 
 function hoursFromPkg(pkg) {
   if (pkg === '50-150-5h') return 2;
@@ -18,13 +18,18 @@ function hoursFromPkg(pkg) {
   return 2;
 }
 
+// Build an ISO for a given local hour in a target TZ (keeps the *wall time*).
 function zonedStartISO(ymd, hour, tz) {
   const [y, m, d] = String(ymd).split('-').map(Number);
-  // Build local time in tz, then convert to ISO reliably
-  const localStr = new Date(Date.UTC(y, m - 1, d, hour, 0, 0)).toLocaleString('en-US', { timeZone: tz });
-  const localDate = new Date(localStr);
-  // localDate now represents that wall time in tz; produce ISO in UTC
-  return new Date(localDate.getTime() - localDate.getTimezoneOffset() * 60000).toISOString();
+  // Create that wall time in the target tz using Intl trick
+  const dt = new Date(Date.UTC(y, m - 1, d, hour, 0, 0));
+  const fmt = new Intl.DateTimeFormat('en-US', {
+    timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false
+  });
+  const parts = Object.fromEntries(fmt.formatToParts(dt).map(p => [p.type, p.value]));
+  const local = new Date(`${parts.year}-${parts.month}-${parts.day}T${parts.hour}:${parts.minute}:${parts.second}`);
+  return new Date(local.getTime() - local.getTimezoneOffset() * 60000).toISOString();
 }
 
 function fullBlock(startISO, liveHours) {
@@ -36,36 +41,25 @@ function fullBlock(startISO, liveHours) {
 
 export default async function handler(req, res) {
   // CORS
-  const allow = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
-  const origin = req.headers.origin || '';
-  const okOrigin = allow.length ? allow.includes(origin) : true;
-
-  if (req.method === 'OPTIONS') {
-    res.setHeader('Access-Control-Allow-Origin', okOrigin ? origin : '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-    res.setHeader('Vary', 'Origin');
-    return res.status(204).end();
-  }
-  res.setHeader('Access-Control-Allow-Origin', okOrigin ? origin : '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-  res.setHeader('Vary', 'Origin');
-  if (preflight(req, res)) return;
-  applyCors(res);
+  if (handlePreflight(req, res)) return;
+  applyCors(req, res);
 
   try {
+    if (req.method !== 'GET') {
+      return res.status(405).json({ error: 'method_not_allowed' });
+    }
+
     const { date, pkg } = req.query || {};
     if (!date) return res.status(400).json({ error: 'date required (YYYY-MM-DD)' });
 
     const tz = process.env.TIMEZONE || 'America/Los_Angeles';
-    const calId = process.env.GOOGLE_CALENDAR_ID || 'primary';
+    const calId = process.env.CALENDAR_ID || process.env.GOOGLE_CALENDAR_ID || 'primary';
     const liveHours = hoursFromPkg(String(pkg || ''));
 
-    // Use the SAME OAuth calendar identity you just set up
-    const calendar = await getOAuthCalendar();
+    // ✅ Properly destructure the client
+    const { calendar } = await getOAuthCalendar();
 
-    // Pull all events for the day
+    // Pull all events for the day (local midnight → 23:59)
     const dayStart = zonedStartISO(date, 0, tz);
     const dayEnd   = zonedStartISO(date, 23, tz);
 
@@ -85,12 +79,12 @@ export default async function handler(req, res) {
         end:   new Date(e.end?.dateTime   || e.end?.date)
       }));
 
-    // Day hard-cap: if already 3, return none
+    // Day hard-cap
     if (events.length >= MAX_PER_DAY) {
       return res.status(200).json({ slots: [] });
     }
 
-    // Generate candidate starts and allow slot only if < 2 overlaps
+    // Generate candidate starts
     const now = new Date();
     const slots = [];
     for (let h = HOURS_RANGE.start; h <= HOURS_RANGE.end; h++) {
@@ -99,10 +93,7 @@ export default async function handler(req, res) {
 
       const { blockStart, blockEnd } = fullBlock(startISO, liveHours);
       const overlapping = events.filter(ev => !(ev.end <= blockStart || ev.start >= blockEnd)).length;
-
-      if (overlapping < MAX_PER_SLOT) {
-        slots.push({ startISO });
-      }
+      if (overlapping < MAX_PER_SLOT) slots.push({ startISO });
     }
 
     return res.status(200).json({ slots });

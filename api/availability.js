@@ -1,145 +1,134 @@
 // /api/availability.js
 export const config = { runtime: 'nodejs' };
 
-import { applyCors, handlePreflight } from './_cors.js';
-import { google } from 'googleapis';
+import { applyCors, preflight } from './_cors.js';
+import { getOAuthCalendar } from './_google.js';
 
-// ---- Business rules ----
-const WINDOW_START_HOUR = 7;   // 7 AM first selectable start
-const WINDOW_END_HOUR   = 22;  // 10 PM last selectable start (hourly)
-const PREP_HOURS   = 1;
-const CLEAN_HOURS  = 1;
-const PER_SLOT_CAP = 2;        // max bars overlapping the same full block
-const DAY_CAP      = 3;        // max events per day
+// === Parámetros de negocio ===
+const TIMEZONE = process.env.TIMEZONE || 'America/Los_Angeles';
+const HOURS_RANGE = { start: 9, end: 22 };          // Start times permitidos: 09:00 → 22:00
+const PREP_HOURS = 1;
+const CLEAN_HOURS = 1;
+const MAX_CONCURRENT = 2;                            // Máximo 2 eventos superpuestos en la ventana completa
+const MAX_PER_DAY = 3;                               // Máximo 3 eventos por día
 
-// Map package → live service hours
-const LIVE_HOURS_BY_PKG = {
-  '50-150-5h': 2,
-  '150-250-5h': 2.5,
-  '250-350-6h': 3
-};
-
-const TZ = process.env.TIMEZONE || 'America/Los_Angeles';
-const CALENDAR_ID = process.env.GOOGLE_CALENDAR_ID || 'primary';
-
-// Build an OAuth2 Google Calendar client from env (Option B)
-function getOAuthCalendar() {
-  const clientId = process.env.GOOGLE_OAUTH_CLIENT_ID;
-  const clientSecret = process.env.GOOGLE_OAUTH_CLIENT_SECRET;
-  const redirectUri = process.env.GOOGLE_OAUTH_REDIRECT_URI;
-  const refreshToken = process.env.GOOGLE_OAUTH_REFRESH_TOKEN;
-
-  if (!clientId || !clientSecret || !redirectUri || !refreshToken) {
-    throw new Error('Missing OAuth env vars (CLIENT_ID/SECRET/REDIRECT_URI/REFRESH_TOKEN)');
-  }
-
-  const oAuth2Client = new google.auth.OAuth2(clientId, clientSecret, redirectUri);
-  oAuth2Client.setCredentials({ refresh_token: refreshToken });
-  return google.calendar({ version: 'v3', auth: oAuth2Client });
+function hoursFromPkg(pkg) {
+  if (pkg === '50-150-5h') return 2;
+  if (pkg === '150-250-5h') return 2.5;
+  if (pkg === '250-350-6h') return 3;
+  // default
+  return 2;
 }
 
-// Build an ISO string representing local (TZ) date + hour
-function zonedISO(ymd /* YYYY-MM-DD */, hour /* 0-23 */, tz /* IANA TZ */) {
+// Convierte YYYY-MM-DD + hora local -> ISO UTC estable
+function zonedISO(ymd, hour, tz) {
   const [y, m, d] = ymd.split('-').map(Number);
-  // Start with UTC guess
-  const guessUtcMs = Date.UTC(y, m - 1, d, hour, 0, 0);
-  // Convert that moment to TZ local time, then get the offset difference
-  const asLocal = new Date(new Date(guessUtcMs).toLocaleString('en-US', { timeZone: tz }));
-  const offsetMs = asLocal.getTime() - guessUtcMs;
-  return new Date(guessUtcMs - offsetMs).toISOString();
+  // Creamos un Date en UTC “aproximado”
+  const guessUtc = Date.UTC(y, m - 1, d, hour, 0, 0);
+  // Lo renderizamos en tz y medimos el offset real
+  const asLocal = new Date(new Date(guessUtc).toLocaleString('en-US', { timeZone: tz }));
+  const offsetMs = asLocal.getTime() - guessUtc;
+  return new Date(guessUtc - offsetMs).toISOString();
 }
 
-// Check overlap between two [start,end) ranges (Date)
 function overlaps(aStart, aEnd, bStart, bEnd) {
   return (aStart < bEnd) && (aEnd > bStart);
 }
 
 export default async function handler(req, res) {
   // CORS
-  if (handlePreflight(req, res)) return;
-  applyCors(req, res);
+  const allow = (process.env.ALLOWED_ORIGINS || '')
+    .split(',').map(s => s.trim()).filter(Boolean);
+  const origin = req.headers.origin || '';
+  const okOrigin = allow.length ? allow.includes(origin) : true;
+
+  if (req.method === 'OPTIONS') {
+    res.setHeader('Access-Control-Allow-Origin', okOrigin ? origin : '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    res.setHeader('Vary', 'Origin');
+    return res.status(204).end();
+  }
+  res.setHeader('Access-Control-Allow-Origin', okOrigin ? origin : '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Vary', 'Origin');
+  if (preflight(req, res)) return;
+  applyCors(res);
+
+  if (req.method !== 'GET') {
+    return res.status(405).json({ error: 'method_not_allowed' });
+  }
 
   try {
-    if (req.method !== 'GET') {
-      return res.status(405).json({ ok: false, error: 'method_not_allowed' });
-    }
-
     const { date, pkg } = req.query || {};
-    if (!date) {
-      return res.status(400).json({ ok: false, error: 'date_required_YYYY_MM_DD' });
-    }
+    if (!date) return res.status(400).json({ error: 'date required (YYYY-MM-DD)' });
 
-    // Resolve live service hours (fallback = 2)
-    const liveHours = LIVE_HOURS_BY_PKG[pkg] ?? 2;
+    const liveHours = hoursFromPkg(String(pkg || ''));
 
-    // If no calendar configured, just emit the plain hourly grid
-    if (!CALENDAR_ID) {
-      const slots = [];
-      for (let h = WINDOW_START_HOUR; h <= WINDOW_END_HOUR; h++) {
-        const startISO = zonedISO(date, h, TZ);
-        // skip past times (compare in real now)
-        if (new Date(startISO) < new Date()) continue;
-        slots.push({ startISO });
-      }
-      return res.status(200).json({ ok: true, slots });
-    }
+    // OAuth Calendar
+    const calendar = await getOAuthCalendar(); // ya debe tener tokens (GOOGLE_OAUTH_REFRESH_TOKEN)
+    const calendarId = process.env.GOOGLE_CALENDAR_ID || 'primary';
 
-    // Fetch all events for the day (in TZ window)
-    const calendar = getOAuthCalendar();
-    const timeMin = zonedISO(date, 0, TZ);   // 00:00 TZ
-    const timeMax = zonedISO(date, 23, TZ);  // 23:00 TZ (covers the day)
-    const rsp = await calendar.events.list({
-      calendarId: CALENDAR_ID,
-      timeMin,
-      timeMax,
+    // Rango del día (local 00:00 → 24:00) convertido a ISO
+    const dayStartISO = zonedISO(date, 0, TIMEZONE);
+    const dayEndISO   = zonedISO(date, 24, TIMEZONE);
+
+    // Leemos todos los eventos del día
+    const list = await calendar.events.list({
+      calendarId,
+      timeMin: dayStartISO,
+      timeMax: dayEndISO,
       singleEvents: true,
       orderBy: 'startTime',
-      maxResults: 2500
+      maxResults: 250
     });
 
-    const items = (rsp.data.items || []).filter(e => e.status !== 'cancelled');
+    const items = (list.data.items || []).filter(e => e.status !== 'cancelled');
 
-    // Day cap (max events per day)
-    if (items.length >= DAY_CAP) {
-      return res.status(200).json({ ok: true, slots: [] });
+    // Tope diario: si ya hay >= MAX_PER_DAY → no slots
+    if (items.length >= MAX_PER_DAY) {
+      return res.status(200).json({ slots: [] });
     }
 
-    // Normalize existing events to Date ranges
+    // Normalizamos a rangos Date (start/end)
     const existing = items.map(e => {
-      const s = e.start?.dateTime || e.start?.date; // all-day uses date
-      const eend = e.end?.dateTime || e.end?.date;
+      const s = e.start?.dateTime || e.start?.date;
+      const en = e.end?.dateTime || e.end?.date;
       return {
         start: new Date(s),
-        end: new Date(eend)
+        end: new Date(en)
       };
     });
 
+    // Generamos candidatos (cada hora)
     const now = new Date();
     const slots = [];
-
-    for (let h = WINDOW_START_HOUR; h <= WINDOW_END_HOUR; h++) {
-      const startISO = zonedISO(date, h, TZ);
+    for (let h = HOURS_RANGE.start; h <= HOURS_RANGE.end; h++) {
+      const startISO = zonedISO(date, h, TIMEZONE);
       const start = new Date(startISO);
 
-      // skip past
+      // omitimos horas pasadas
       if (start < now) continue;
 
-      // Full block = prep + live + clean
+      // Ventana completa que debemos respetar
       const blockStart = new Date(start.getTime() - PREP_HOURS * 3600e3);
       const blockEnd   = new Date(start.getTime() + (liveHours + CLEAN_HOURS) * 3600e3);
 
-      // Count overlaps against the full block
-      const overlapsCount = existing.reduce((acc, ev) => acc + (overlaps(blockStart, blockEnd, ev.start, ev.end) ? 1 : 0), 0);
+      // Contamos cuántos eventos del calendario pisan esta ventana completa
+      const concurrent = existing.reduce((acc, ev) => {
+        return acc + (overlaps(blockStart, blockEnd, ev.start, ev.end) ? 1 : 0);
+      }, 0);
 
-      // Respect per-slot cap (max 2 overlapping bars)
-      if (overlapsCount >= PER_SLOT_CAP) continue;
-
-      slots.push({ startISO });
+      // Permitimos el slot solo si hay menos de MAX_CONCURRENT superpuestos
+      if (concurrent < MAX_CONCURRENT) {
+        slots.push({ startISO: start.toISOString() });
+      }
     }
 
-    return res.status(200).json({ ok: true, slots });
+    return res.status(200).json({ slots });
   } catch (e) {
-    console.error('availability error', e);
-    return res.status(500).json({ ok: false, error: 'availability_failed', detail: e.message });
+    console.error('availability error', e?.response?.data || e);
+    return res.status(500).json({ error: 'availability_failed', detail: String(e?.message || e) });
   }
 }

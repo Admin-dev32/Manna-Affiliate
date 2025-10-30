@@ -2,16 +2,16 @@
 export const config = { runtime: 'nodejs' };
 
 import { applyCors, preflight } from './_cors.js';
-import { getOAuthCalendar } from './_google.js'; // debe devolver cliente OAuth2 con token válido
+import { getOAuthCalendar } from './_google.js';   // returns an OAuth2-authenticated Calendar client
 import { resolveAffiliate } from './_affiliates.js';
 
-function safeStr(v, fb = '') { return (typeof v === 'string' ? v : fb).trim(); }
+function s(v, fb = '') { return (typeof v === 'string' ? v : fb).trim(); }
 
 function pkgLabel(v) {
   const map = {
-    '50-150-5h': '50–150 (5h ventana)',
-    '150-250-5h': '150–250 (5h ventana)',
-    '250-350-6h': '250–350 (6h ventana)',
+    '50-150-5h': '50–150 (5h window)',
+    '150-250-5h': '150–250 (5h window)',
+    '250-350-6h': '250–350 (6h window)',
   };
   return map[v] || v || '';
 }
@@ -20,23 +20,23 @@ function barLabel(v) {
   const map = {
     pancake: 'Mini Pancake',
     maruchan: 'Maruchan',
-    esquites: 'Esquites',
+    esquites: 'Esquites (Corn Cups)',
     snack: 'Manna Snack — Classic',
     tostiloco: 'Tostiloco (Premium)',
   };
   return map[v] || v || 'Bar';
 }
 
-function hoursFromPkg(pkg) {
+function serviceHoursFromPkg(pkg) {
+  // “live” service hours (prep/clean noted in description)
   if (pkg === '50-150-5h') return 2;
   if (pkg === '150-250-5h') return 2.5;
   if (pkg === '250-350-6h') return 3;
   return 2;
 }
 
-// Convierte startISO a endISO sumando servicio + 1h clean, y asume 1h de prep antes (solo lo ponemos en descripción)
 function computeEndISO(startISO, pkg) {
-  const live = hoursFromPkg(pkg);
+  const live = serviceHoursFromPkg(pkg);
   const CLEAN_HOURS = 1;
   const start = new Date(startISO);
   const end = new Date(start.getTime() + (live + CLEAN_HOURS) * 3600 * 1000);
@@ -44,8 +44,8 @@ function computeEndISO(startISO, pkg) {
 }
 
 export default async function handler(req, res) {
-  // CORS
-  const allow = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
+  // Basic allowlist CORS (plus shared helpers)
+  const allow = (process.env.ALLOWED_ORIGINS || '').split(',').map(x => x.trim()).filter(Boolean);
   const origin = req.headers.origin || '';
   const okOrigin = allow.length ? allow.includes(origin) : true;
 
@@ -69,63 +69,73 @@ export default async function handler(req, res) {
 
   try {
     const body = req.body || {};
-    const pin = safeStr(body.pin);
+
+    // Validate affiliate by PIN
+    const pin = s(body.pin);
     const aff = resolveAffiliate(pin);
     if (!aff) {
       return res.status(400).json({ ok: false, error: 'invalid_pin' });
     }
 
-    const startISO = safeStr(body.startISO);
-    const pkg = safeStr(body.pkg);
-    const mainBar = safeStr(body.mainBar);
-    const fullName = safeStr(body.fullName);
-    const venue = safeStr(body.venue);
-    const notes = safeStr(body.notes);
+    // Required booking fields
+    const startISO = s(body.startISO);
+    const pkg = s(body.pkg);
+    const mainBar = s(body.mainBar);
+    const fullName = s(body.fullName);
 
     if (!startISO || !pkg || !mainBar || !fullName) {
-      return res.status(400).json({ ok: false, error: 'missing_fields' });
+      return res.status(400).json({
+        ok: false,
+        error: 'missing_fields',
+        need: { startISO: !!startISO, pkg: !!pkg, mainBar: !!mainBar, fullName: !!fullName }
+      });
     }
 
+    // Optional fields
+    const venue = s(body.venue);
+    const notes = s(body.notes);
     const endISO = computeEndISO(startISO, pkg);
 
-    // 📧 Invitados (cliente + afiliado si tienen correo)
+    // Attendees (client + affiliate if email provided)
     const attendees = [];
-    const clientEmail = safeStr(body.email);
-    const affiliateEmail = safeStr(body.affiliateEmail);
+    const clientEmail = s(body.email);
+    const affiliateEmail = s(body.affiliateEmail);
     if (clientEmail) attendees.push({ email: clientEmail });
     if (affiliateEmail) attendees.push({ email: affiliateEmail });
 
-    // Título claro (sin "Manager")
+    // Event title (no “Manager”)
     const title = `Manna Snack Bars — ${barLabel(mainBar)} — ${pkgLabel(pkg)} — ${fullName}`;
 
-    const calId = process.env.GOOGLE_CALENDAR_ID || 'primary';
-    const calendar = await getOAuthCalendar(); // usa OAUTH (no service account)
+    // Choose calendar id from envs (supports either name)
+    const calId = process.env.CALENDAR_ID || process.env.GOOGLE_CALENDAR_ID || 'primary';
 
+    // OAuth calendar client (user-consent flow)
+    const calendar = await getOAuthCalendar();
+
+    // Build event body
     const event = {
       summary: title,
       location: venue || undefined,
       description: [
-        `📦 Paquete: ${pkgLabel(pkg)}`,
-        `🍫 Barra principal: ${barLabel(mainBar)}`,
-        body.secondEnabled ? `➕ Segunda barra: ${barLabel(safeStr(body.secondBar))} (${pkgLabel(safeStr(body.secondSize))})` : '',
-        body.fountainEnabled ? `🍫 Fuente de chocolate: ${safeStr(body.fountainType)} para ${safeStr(body.fountainSize)} personas` : '',
-        notes ? `📝 Notas: ${notes}` : '',
+        `📦 Package: ${pkgLabel(pkg)}`,
+        `🍫 Main bar: ${barLabel(mainBar)}`,
+        body.secondEnabled ? `➕ Second bar: ${barLabel(s(body.secondBar))} (${pkgLabel(s(body.secondSize))})` : '',
+        body.fountainEnabled ? `🍫 Chocolate fountain: ${s(body.fountainType)} for ${s(body.fountainSize)} guests` : '',
+        notes ? `📝 Notes: ${notes}` : '',
         '',
-        `⏱️ Preparación: 1h antes del inicio`,
-        `⏱️ Servicio: ${hoursFromPkg(pkg)}h (+ 1h limpieza)`,
+        `⏱️ Prep: 1h before start`,
+        `⏱️ Service: ${serviceHoursFromPkg(pkg)}h (+ 1h cleanup)`,
         '',
-        `👤 Afiliado: ${aff.name} (PIN: ${pin})`
+        `👤 Affiliate: ${aff.name} (PIN: ${pin})`
       ].filter(Boolean).join('\n'),
       start: { dateTime: startISO },
       end:   { dateTime: endISO },
       attendees: attendees.length ? attendees : undefined,
       guestsCanSeeOtherGuests: true,
-      reminders: {
-        useDefault: true
-      },
+      reminders: { useDefault: true }
     };
 
-    // Enviar invitaciones a los asistentes
+    // Create event and send invitations if we have attendees
     const rsp = await calendar.events.insert({
       calendarId: calId,
       sendUpdates: attendees.length ? 'all' : 'none',

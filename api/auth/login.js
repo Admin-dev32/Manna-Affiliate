@@ -15,17 +15,29 @@ export default async function handler(req, res) {
     }
 
     const { pin } = req.body || {};
-    if (!pin) {
+    const cleanPin = String(pin || '').trim();
+    if (!cleanPin) {
       return res.status(400).json({ ok: false, error: 'missing_pin' });
     }
 
-    const affiliate = resolveAffiliate(String(pin).trim());
-    if (!affiliate) {
-      return res.status(401).json({ ok: false, error: 'Invalid PIN' });
+    const aff = resolveAffiliate(cleanPin);
+    if (!aff) {
+      return res.status(200).json({ ok: false, error: 'Invalid PIN' });
     }
 
-    // include email if present in your AFFILIATES_JSON entry
-    return res.status(200).json({ ok: true, affiliate });
+    // Return the affiliate object including allowDiscount/email/etc.
+    return res.status(200).json({
+      ok: true,
+      affiliate: {
+        id: aff.id,
+        name: aff.name,
+        email: aff.email || '',
+        allowDiscount: !!aff.allowDiscount,
+        bundleRate: aff.bundleRate,
+        commissionsByPkg: aff.commissionsByPkg,
+        fountainCommission: aff.fountainCommission,
+      },
+    });
   } catch (e) {
     console.error('auth/login error', e);
     return res.status(500).json({ ok: false, error: 'login_failed', detail: e.message });

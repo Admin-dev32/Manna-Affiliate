@@ -1,126 +1,155 @@
 // /api/create-booking.js
 export const config = { runtime: 'nodejs' };
 
-import { applyCors, preflight } from './_cors.js';
-import { getCalendarForCreate, toRFC3339, tz, calId } from './_google.js';
+// Uses Google OAuth (installed app) with refresh token
+import { google } from 'googleapis';
 
-function nameForBar(code) {
-  switch (code) {
-    case 'pancake': return 'Mini Pancake';
-    case 'maruchan': return 'Maruchan';
-    case 'esquites': return 'Esquites (Corn Cups)';
-    case 'snack': return 'Manna Snack — Classic';
-    case 'tostiloco': return 'Tostiloco (Premium)';
-    default: return code || 'Bar';
-  }
+function cors(req, res) {
+  const allow = (process.env.ALLOWED_ORIGINS || '')
+    .split(',').map(s => s.trim()).filter(Boolean);
+  const origin = req.headers.origin || '';
+  const willAllow = allow.length ? allow.includes(origin) : true;
+
+  res.setHeader('Access-Control-Allow-Origin', willAllow ? origin || '*' : '*');
+  res.setHeader('Access-Control-Allow-Methods', 'POST,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Vary', 'Origin');
+  if (req.method === 'OPTIONS') { res.status(204).end(); return true; }
+  return false;
 }
 
-function titleForEvent(data) {
-  const pkg = data.pkg || '';
-  const who = (data.fullName || 'Client').trim();
-  const main = nameForBar(data.mainBar);
-  return `Manna Snack Bars — ${pkg.replaceAll('-', '–')} — ${who} (${main}${data.noDeposit ? ', No deposit' : ''})`;
+function pickTitle(mainBar, pkg) {
+  const titleMap = {
+    pancake: 'Mini Pancake',
+    maruchan: 'Maruchan',
+    esquites: 'Esquites (Corn Cups)',
+    snack: 'Manna Snack — Classic',
+    tostiloco: 'Tostiloco (Premium)'
+  };
+  const sizeMap = {
+    '50-150-5h': '50–150',
+    '150-250-5h': '150–250',
+    '250-350-6h': '250–350'
+  };
+  return `${titleMap[mainBar] || 'Service'} — ${sizeMap[pkg] || pkg}`;
 }
 
-function descriptionForEvent(data) {
-  const lines = [
-    `Client: ${data.fullName || '—'}`,
-    `Email: ${data.email || '(none)'}`,
-    `Phone: ${data.phone || '(none)'}`,
-    `Venue: ${data.venue || '(none)'}`,
-    `Package: ${data.pkg || '—'}${data.mainBar ? ` (${nameForBar(data.mainBar)})` : ''}`,
-  ];
-
-  if (data.secondEnabled && data.secondBar) {
-    lines.push(`Second bar: ${nameForBar(data.secondBar)} — ${data.secondSize || ''}`);
-  }
-  if (data.fountainEnabled && data.fountainSize) {
-    lines.push(`Chocolate fountain: ${data.fountainSize} (${data.fountainType || 'dark'})`);
-  }
-
-  lines.push(
-    `Totals: total $${(data.total ?? 0)} — deposit $${(data.deposit ?? 0)} — balance $${(data.balance ?? 0)}`
-  );
-
-  const aff = data.affiliateName || '';
-  const affEmail = data.affiliateEmail || '';
-  lines.push(`Affiliate: ${aff}${affEmail ? ` — ${affEmail}` : ''}`);
-
-  if (data.notes) {
-    lines.push('');
-    lines.push('Notes:');
-    lines.push(data.notes);
-  }
-
-  return lines.join('\n');
-}
-
-// duration rules (live: 2 / 2.5 / 3h + prep/clean included in availability)
-function liveHoursForPkg(pkg) {
+function pkgToHours(pkg) {
+  if (pkg === '50-150-5h') return 2;
   if (pkg === '150-250-5h') return 2.5;
   if (pkg === '250-350-6h') return 3;
   return 2;
 }
 
 export default async function handler(req, res) {
-  if (preflight(req, res)) return;
-  applyCors(res);
+  if (cors(req, res)) return;
+  if (req.method !== 'POST') return res.status(405).json({ ok:false, error:'Method not allowed' });
 
   try {
-    if (req.method !== 'POST') {
-      return res.status(405).json({ ok: false, error: 'Method not allowed' });
+    const {
+      fullName, email, phone, venue,
+      dateISO, startISO, pkg, mainBar,
+      secondEnabled, secondBar, secondSize,
+      fountainEnabled, fountainSize, fountainType,
+      discountMode, discountValue,
+      deposit, total, balance, notes,
+      affiliateName, affiliateEmail, pin,
+      noDeposit
+    } = req.body || {};
+
+    if (!startISO) return res.status(400).json({ ok:false, error:'Missing startISO (pick a slot)' });
+
+    // OAuth2 client using refresh token
+    const clientId     = process.env.GOOGLE_OAUTH_CLIENT_ID;
+    const clientSecret = process.env.GOOGLE_OAUTH_CLIENT_SECRET;
+    const redirectUri  = process.env.GOOGLE_OAUTH_REDIRECT_URI;
+    const refreshToken = process.env.GOOGLE_OAUTH_REFRESH_TOKEN;
+
+    if (!clientId || !clientSecret || !redirectUri || !refreshToken) {
+      return res.status(500).json({ ok:false, error:'Missing Google OAuth env vars' });
     }
 
-    const body = req.body || {};
-    const {
-      startISO, pkg, fullName, venue,
-      email, // client email (optional)
-      affiliateEmail, // optional; add as guest only if present
-    } = body;
+    const oAuth2Client = new google.auth.OAuth2(clientId, clientSecret, redirectUri);
+    oAuth2Client.setCredentials({ refresh_token: refreshToken });
 
-    if (!startISO) return res.status(400).json({ ok: false, error: 'startISO required' });
+    const calendarId = process.env.CALENDAR_ID || process.env.GOOGLE_CALENDAR_ID || 'primary';
+    const tz = process.env.TIMEZONE || 'America/Los_Angeles';
 
-    // Attendees list (OAuth required if non-empty)
-    const attendees = [];
-    if (email) attendees.push({ email: String(email).trim() });
-    if (affiliateEmail) attendees.push({ email: String(affiliateEmail).trim() });
-
-    const needsOAuth = attendees.length > 0;
-
-    // Build calendar with correct auth
-    const { calendar } = await getCalendarForCreate(needsOAuth);
-
-    // Compute end by live-hours only (prep/cleanup are already blocked in availability)
-    const liveHrs = liveHoursForPkg(pkg);
     const start = new Date(startISO);
-    const end = new Date(start.getTime() + liveHrs * 3600 * 1000);
+    const liveHours = pkgToHours(String(pkg));
+    const end = new Date(start.getTime() + liveHours * 60 * 60 * 1000);
+
+    const summary = pickTitle(String(mainBar || ''), String(pkg || ''));
+    const descriptionLines = [
+      `Client: ${fullName || ''}`,
+      email ? `Email: ${email}` : '',
+      phone ? `Phone: ${phone}` : '',
+      venue ? `Venue: ${venue}` : '',
+      '',
+      `Main bar: ${summary}`,
+      secondEnabled ? `Second bar: ${secondBar || '-'} (${secondSize || '-'})` : '',
+      fountainEnabled ? `Chocolate fountain: size ${fountainSize || '-'} ${fountainType ? `(${fountainType})` : ''}` : '',
+      '',
+      `Totals — Total: $${Number(total||0).toFixed(0)} | Deposit: $${Number(deposit||0).toFixed(0)} | Balance: $${Number(balance||0).toFixed(0)}`,
+      discountMode && discountMode!=='none' ? `Discount: ${discountMode} ${discountValue||0}` : '',
+      '',
+      notes ? `Notes: ${notes}` : '',
+      '',
+      `Affiliate: ${affiliateName || ''} ${affiliateEmail ? `<${affiliateEmail}>` : ''}`,
+      pin ? `Affiliate PIN: ${pin}` : ''
+    ].filter(Boolean);
+
+    // Build attendees from provided emails
+    const attendees = [];
+    // client email (optional)
+    if (email && /\S+@\S+\.\S+/.test(email)) attendees.push({ email: email.trim() });
+    // affiliate email (optional)
+    if (affiliateEmail && /\S+@\S+\.\S+/.test(affiliateEmail)) attendees.push({ email: affiliateEmail.trim() });
 
     const event = {
-      summary: titleForEvent(body),
-      description: descriptionForEvent(body),
-      start: { dateTime: toRFC3339(start), timeZone: tz() },
-      end: { dateTime: toRFC3339(end), timeZone: tz() },
+      summary,
       location: venue || '',
-      attendees: attendees.length ? attendees : undefined, // only include if not empty
+      description: descriptionLines.join('\n'),
+      start: { dateTime: start.toISOString(), timeZone: tz },
+      end:   { dateTime: end.toISOString(),   timeZone: tz },
+      attendees,
+      extendedProperties: {
+        private: {
+          pkg: String(pkg || ''),
+          mainBar: String(mainBar || ''),
+          secondEnabled: String(!!secondEnabled),
+          secondBar: String(secondBar || ''),
+          secondSize: String(secondSize || ''),
+          fountainEnabled: String(!!fountainEnabled),
+          fountainSize: String(fountainSize || ''),
+          fountainType: String(fountainType || ''),
+          affiliateName: String(affiliateName || ''),
+          affiliateEmail: String(affiliateEmail || ''),
+          pin: String(pin || '')
+        }
+      }
     };
 
-    const created = await calendar.events.insert({
-      calendarId: calId(),
+    const cal = google.calendar({ version: 'v3', auth: oAuth2Client });
+
+    // Create the event and send invites
+    const created = await cal.events.insert({
+      calendarId,
       requestBody: event,
-      sendUpdates: attendees.length ? 'all' : 'none',
+      sendUpdates: 'all' // 👈 send invitations
     });
 
-    return res.status(200).json({
-      ok: true,
-      eventId: created?.data?.id || null,
-    });
+    const eventId = created?.data?.id || '';
+
+    return res.status(200).json({ ok: true, eventId, noDeposit: !!noDeposit });
   } catch (e) {
-    // Surface the common OAuth/service account attendee issue clearly
-    const msg = e?.response?.data?.error || e?.message || 'create_booking_failed';
-    return res.status(500).json({
+    // Helpful Google error passthrough
+    const status = e?.response?.status || 500;
+    const body = e?.response?.data || null;
+    return res.status(status).json({
       ok: false,
       error: 'create_booking_failed',
-      detail: msg,
+      hint: body || String(e?.message || e)
     });
   }
 }

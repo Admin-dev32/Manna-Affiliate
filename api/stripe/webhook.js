@@ -1,10 +1,9 @@
 // /api/stripe/webhook.js
-export const config = { runtime: 'nodejs' }; // Node runtime on Vercel
+export const config = { runtime: 'nodejs' };
 
 import Stripe from 'stripe';
-import { getOAuthCalendar } from '../_google.js'; // OAuth calendar client
+import { getOAuthCalendar } from '../_google.js';
 
-// ---- helpers ----
 function hoursFromPkg(pkg) {
   if (pkg === '50-150-5h') return 2;
   if (pkg === '150-250-5h') return 2.5;
@@ -31,7 +30,6 @@ function pkgLabel(v) {
 }
 function safeStr(v, fb = '') { return (typeof v === 'string' ? v : fb).trim(); }
 
-// Build end time: live + 1h cleanup (prep is informational, not part of event)
 function computeEndISO(startISO, pkg) {
   const live = hoursFromPkg(pkg);
   const CLEAN_HOURS = 1;
@@ -40,7 +38,6 @@ function computeEndISO(startISO, pkg) {
   return end.toISOString();
 }
 
-// Read raw body for Stripe signature verification
 async function readRawBody(req) {
   const chunks = [];
   for await (const chunk of req) chunks.push(chunk);
@@ -49,13 +46,13 @@ async function readRawBody(req) {
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
-    // Stripe expects 405 on non-POST; no CORS here.
     res.status(405).send('Method Not Allowed');
     return;
   }
 
   const stripeSecret = process.env.STRIPE_SECRET_KEY;
   const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+  const calendarId = process.env.CALENDAR_ID || process.env.GOOGLE_CALENDAR_ID || 'primary';
 
   if (!stripeSecret || !webhookSecret) {
     console.error('Missing Stripe secrets.');
@@ -76,7 +73,6 @@ export default async function handler(req, res) {
     return;
   }
 
-  // Only handle successful checkout
   if (event.type !== 'checkout.session.completed') {
     res.status(200).json({ ok: true, ignored: event.type });
     return;
@@ -84,48 +80,30 @@ export default async function handler(req, res) {
 
   try {
     const session = event.data.object;
-
-    // Process only if actually paid (paranoia check)
     if (session.payment_status !== 'paid') {
       return res.status(200).json({ ok: true, skipped: 'not_paid' });
     }
 
-    // Pull booking data from metadata (set in /api/create-checkout.js)
     const md = session.metadata || {};
     const pkg = safeStr(md.pkg);
     const mainBar = safeStr(md.mainBar);
     const fullName = safeStr(md.fullName || session.customer_details?.name || 'Client');
     const venue = safeStr(md.venue);
     const startISO = safeStr(md.startISO);
-    const clientEmail = safeStr(md.dateISO ? md.email : md.email); // if you ever add 'email' to metadata
     const affiliateEmail = safeStr(md.affiliateEmail);
-    const affiliateName = safeStr(md.affiliateName);
+    const affiliateName  = safeStr(md.affiliateName);
 
     if (!startISO || !pkg || !mainBar || !fullName) {
       console.error('Missing required booking fields in metadata:', md);
-      return res.status(200).json({ ok: true, skipped: 'missing_metadata' }); // return 2xx to stop retries
+      return res.status(200).json({ ok: true, skipped: 'missing_metadata' });
     }
 
-    // Build event
-    const endISO = computeEndISO(startISO, pkg);
-    const attendees = [];
-    // Prefer the email entered at checkout if present
-    const checkoutEmail = safeStr(session.customer_details?.email);
-    if (checkoutEmail) attendees.push({ email: checkoutEmail });
-    if (affiliateEmail) attendees.push({ email: affiliateEmail });
+    // ✅ Calendar client (destructure)
+    const { calendar } = await getOAuthCalendar();
 
-    const title = `Manna Snack Bars — ${barLabel(mainBar)} — ${pkgLabel(pkg)} — ${fullName}`;
-
-    const calendarId = process.env.GOOGLE_CALENDAR_ID || 'primary';
-    const calendar = await getOAuthCalendar();
-
-    // Idempotency: avoid duplicates if Stripe retries
-    // Use session.id stored in Google extendedProperties.private
+    // Idempotency: skip if same session already created
     const sessionId = safeStr(session.id);
-    if (!sessionId) {
-      console.warn('No session.id in event; proceeding without idempotency guard.');
-    } else {
-      // Narrow search to the event date to keep it cheap
+    if (sessionId) {
       const day = new Date(startISO);
       const dayStart = new Date(day.getFullYear(), day.getMonth(), day.getDate(), 0, 0, 0).toISOString();
       const dayEnd   = new Date(day.getFullYear(), day.getMonth(), day.getDate(), 23, 59, 59).toISOString();
@@ -140,12 +118,18 @@ export default async function handler(req, res) {
       });
 
       if ((existing.data.items || []).length > 0) {
-        // Already created
         return res.status(200).json({ ok: true, already: true });
       }
     }
 
-    // Description includes prep/clean windows for clarity (they are not blocked here)
+    const attendees = [];
+    const checkoutEmail = safeStr(session.customer_details?.email);
+    if (checkoutEmail) attendees.push({ email: checkoutEmail });
+    if (affiliateEmail) attendees.push({ email: affiliateEmail });
+
+    const endISO = computeEndISO(startISO, pkg);
+    const title = `Manna Snack Bars — ${barLabel(mainBar)} — ${pkgLabel(pkg)} — ${fullName}`;
+
     const description = [
       `📦 Package: ${pkgLabel(pkg)}`,
       `🍫 Main bar: ${barLabel(mainBar)}`,
@@ -165,12 +149,9 @@ export default async function handler(req, res) {
       attendees: attendees.length ? attendees : undefined,
       guestsCanSeeOtherGuests: true,
       reminders: { useDefault: true },
-      extendedProperties: {
-        private: { sessionId: safeStr(session.id) }
-      }
+      extendedProperties: { private: { sessionId } }
     };
 
-    // Create the event and send invite emails if there are attendees
     const resp = await calendar.events.insert({
       calendarId,
       sendUpdates: attendees.length ? 'all' : 'none',
@@ -180,8 +161,7 @@ export default async function handler(req, res) {
     return res.status(200).json({ ok: true, created: resp.data?.id || null });
   } catch (err) {
     console.error('webhook create-event error:', err?.response?.data || err);
-    // Return 200 with an "error" so Stripe does NOT keep retrying forever.
-    // If you prefer retries while you fix issues, return 500 instead.
+    // Return 200 so Stripe doesn't retry forever
     return res.status(200).json({ ok: false, error: 'create_event_failed', detail: String(err?.message || err) });
   }
 }

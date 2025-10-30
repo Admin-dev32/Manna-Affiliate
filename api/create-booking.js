@@ -1,89 +1,126 @@
 // /api/create-booking.js
 export const config = { runtime: 'nodejs' };
 
-import { getOAuthCalendar } from './_google_oauth.js';
 import { applyCors, preflight } from './_cors.js';
+import { getCalendarForCreate, toRFC3339, tz, calId } from './_google.js';
+
+function nameForBar(code) {
+  switch (code) {
+    case 'pancake': return 'Mini Pancake';
+    case 'maruchan': return 'Maruchan';
+    case 'esquites': return 'Esquites (Corn Cups)';
+    case 'snack': return 'Manna Snack — Classic';
+    case 'tostiloco': return 'Tostiloco (Premium)';
+    default: return code || 'Bar';
+  }
+}
+
+function titleForEvent(data) {
+  const pkg = data.pkg || '';
+  const who = (data.fullName || 'Client').trim();
+  const main = nameForBar(data.mainBar);
+  return `Manna Snack Bars — ${pkg.replaceAll('-', '–')} — ${who} (${main}${data.noDeposit ? ', No deposit' : ''})`;
+}
+
+function descriptionForEvent(data) {
+  const lines = [
+    `Client: ${data.fullName || '—'}`,
+    `Email: ${data.email || '(none)'}`,
+    `Phone: ${data.phone || '(none)'}`,
+    `Venue: ${data.venue || '(none)'}`,
+    `Package: ${data.pkg || '—'}${data.mainBar ? ` (${nameForBar(data.mainBar)})` : ''}`,
+  ];
+
+  if (data.secondEnabled && data.secondBar) {
+    lines.push(`Second bar: ${nameForBar(data.secondBar)} — ${data.secondSize || ''}`);
+  }
+  if (data.fountainEnabled && data.fountainSize) {
+    lines.push(`Chocolate fountain: ${data.fountainSize} (${data.fountainType || 'dark'})`);
+  }
+
+  lines.push(
+    `Totals: total $${(data.total ?? 0)} — deposit $${(data.deposit ?? 0)} — balance $${(data.balance ?? 0)}`
+  );
+
+  const aff = data.affiliateName || '';
+  const affEmail = data.affiliateEmail || '';
+  lines.push(`Affiliate: ${aff}${affEmail ? ` — ${affEmail}` : ''}`);
+
+  if (data.notes) {
+    lines.push('');
+    lines.push('Notes:');
+    lines.push(data.notes);
+  }
+
+  return lines.join('\n');
+}
+
+// duration rules (live: 2 / 2.5 / 3h + prep/clean included in availability)
+function liveHoursForPkg(pkg) {
+  if (pkg === '150-250-5h') return 2.5;
+  if (pkg === '250-350-6h') return 3;
+  return 2;
+}
 
 export default async function handler(req, res) {
-  if (req.method === 'OPTIONS') { res.setHeader('Vary', 'Origin'); return res.status(204).end(); }
-  if (preflight?.(req, res)) return;
-  applyCors?.(res);
-
-  if (req.method !== 'POST') return res.status(405).json({ ok: false, error: 'POST only' });
+  if (preflight(req, res)) return;
+  applyCors(res);
 
   try {
-    const tz = process.env.TIMEZONE || 'America/Los_Angeles';
-    const calendarId = process.env.CALENDAR_ID || 'primary';
+    if (req.method !== 'POST') {
+      return res.status(405).json({ ok: false, error: 'Method not allowed' });
+    }
 
+    const body = req.body || {};
     const {
-      // basics
-      fullName, email, phone, venue,
-      dateISO, startISO,
-      // products
-      pkg, mainBar, secondEnabled, secondBar, secondSize,
-      fountainEnabled, fountainSize, fountainType,
-      // money
-      total, deposit, balance,
-      // aff
-      affiliateName, affiliateEmail, // <— make sure your frontend sends affiliateEmail
-      // flags
-      noDeposit,
-      notes
-    } = req.body || {};
+      startISO, pkg, fullName, venue,
+      email, // client email (optional)
+      affiliateEmail, // optional; add as guest only if present
+    } = body;
 
-    if (!startISO) return res.status(400).json({ ok: false, error: 'Missing startISO' });
+    if (!startISO) return res.status(400).json({ ok: false, error: 'startISO required' });
 
-    // Build title
-    const pkgLabel = (pkg === '50-150-5h' ? '50–150' : pkg === '150-250-5h' ? '150–250' : '250–350');
-    const mainBarLabel = (mainBar || '').replace(/\b\w/g, m => m.toUpperCase());
-    const title = `Manna Snack Bars — ${pkgLabel} — ${fullName || 'Client'}${noDeposit ? ' (No deposit)' : ''} — ${mainBarLabel}`;
+    // Attendees list (OAuth required if non-empty)
+    const attendees = [];
+    if (email) attendees.push({ email: String(email).trim() });
+    if (affiliateEmail) attendees.push({ email: String(affiliateEmail).trim() });
 
-    // Event start/end (startISO is already ISO from client; keep timezone consistent)
-    const start = { dateTime: startISO, timeZone: tz };
+    const needsOAuth = attendees.length > 0;
 
-    // Package live hours (2 / 2.5 / 3) + 1h cleanup
-    const liveHours = pkg === '50-150-5h' ? 2 : pkg === '150-250-5h' ? 2.5 : 3;
-    const endDate = new Date(new Date(startISO).getTime() + (liveHours * 3600e3) + (1 * 3600e3));
-    const end = { dateTime: endDate.toISOString(), timeZone: tz };
+    // Build calendar with correct auth
+    const { calendar } = await getCalendarForCreate(needsOAuth);
 
-    // Attendees — only include if we have emails, otherwise omit the property
-    const attendees = []
-    if (email && /\S+@\S+\.\S+/.test(email)) attendees.push({ email, displayName: fullName || undefined });
-    if (affiliateEmail && /\S+@\S+\.\S+/.test(affiliateEmail)) attendees.push({ email: affiliateEmail, displayName: affiliateName || undefined });
+    // Compute end by live-hours only (prep/cleanup are already blocked in availability)
+    const liveHrs = liveHoursForPkg(pkg);
+    const start = new Date(startISO);
+    const end = new Date(start.getTime() + liveHrs * 3600 * 1000);
 
-    // Description
-    const descLines = [
-      `Client: ${fullName || '(unknown)'}`,
-      `Email: ${email || '(none)'}`,
-      `Phone: ${phone || '(none)'}`,
-      `Venue: ${venue || '(none)'}`,
-      `Package: ${pkgLabel}`,
-      `Main bar: ${mainBarLabel}`,
-      secondEnabled ? `Second bar: ${secondBar || ''} — ${secondSize || ''}` : null,
-      fountainEnabled ? `Fountain: ${fountainSize || ''} — ${fountainType || ''}` : null,
-      `Totals: total $${(total||0)} — deposit $${(deposit||0)} — balance $${(balance||0)}`,
-      `Affiliate: ${affiliateName || '(none)'}${affiliateEmail ? ` — ${affiliateEmail}` : ''}`,
-      notes ? `\nNotes:\n${notes}` : ''
-    ].filter(Boolean).join('\n');
-
-    const calendar = await getOAuthCalendar();
+    const event = {
+      summary: titleForEvent(body),
+      description: descriptionForEvent(body),
+      start: { dateTime: toRFC3339(start), timeZone: tz() },
+      end: { dateTime: toRFC3339(end), timeZone: tz() },
+      location: venue || '',
+      attendees: attendees.length ? attendees : undefined, // only include if not empty
+    };
 
     const created = await calendar.events.insert({
-      calendarId,
-      requestBody: {
-        summary: title,
-        location: venue || '',
-        description: descLines,
-        start,
-        end,
-        attendees: attendees.length ? attendees : undefined, // omit if empty (avoids errors)
-        // Leave default guests permissions; Google will email invitations automatically.
-      },
-      sendUpdates: attendees.length ? 'all' : 'none'
+      calendarId: calId(),
+      requestBody: event,
+      sendUpdates: attendees.length ? 'all' : 'none',
     });
 
-    return res.status(200).json({ ok: true, eventId: created.data.id });
+    return res.status(200).json({
+      ok: true,
+      eventId: created?.data?.id || null,
+    });
   } catch (e) {
-    return res.status(500).json({ ok: false, error: 'create_booking_failed', hint: e?.response?.data || e.message });
+    // Surface the common OAuth/service account attendee issue clearly
+    const msg = e?.response?.data?.error || e?.message || 'create_booking_failed';
+    return res.status(500).json({
+      ok: false,
+      error: 'create_booking_failed',
+      detail: msg,
+    });
   }
 }

@@ -30,13 +30,11 @@ export default async function handler(req, res) {
     const cancelUrl  = process.env.STRIPE_CANCEL_URL  || 'https://mannasnackbars.com/';
 
     const body = req.body || {};
-    // force deposit mode
     const deposit = Number(body.deposit || 0);
     if (!(deposit > 0)) {
       return res.status(400).json({ ok: false, error: 'Deposit required. Enter a deposit > $0.' });
     }
 
-    // For description/title
     const pkg = String(body.pkg || '');
     const mainBar = String(body.mainBar || '');
     const clientName = String(body.fullName || 'Client');
@@ -55,7 +53,10 @@ export default async function handler(req, res) {
     };
     const title = `${titleMap[mainBar] || 'Service'} — ${sizeMap[pkg] || pkg} (Deposit)`;
 
-    // 🔹 Pasamos Totals al webhook para que pinte igual
+    // ✅ Include totals so webhook can display them nicely
+    const totalNum   = Number(body.total || 0);
+    const balanceNum = Math.max(0, totalNum - deposit);
+
     const metadata = {
       pkg, mainBar,
       fullName: clientName,
@@ -63,13 +64,15 @@ export default async function handler(req, res) {
       venue: String(body.venue || ''),
       dateISO: String(body.dateISO || ''),
       startISO: String(body.startISO || ''),
+      email: String(body.email || ''), // optional; webhook will prefer checkout email
       affiliateName: String(body.affiliateName || ''),
       affiliateEmail: String(body.affiliateEmail || ''),
       pin: String(body.pin || ''),
       payMode: 'deposit',
-      total: String(body.total ?? ''),     // 💰
-      deposit: String(body.deposit ?? ''), // 💰
-      balance: String(body.balance ?? ''), // 💰
+      // totals
+      deposit: String(Math.round(deposit)),
+      total: String(Math.round(totalNum)),
+      balance: String(Math.round(balanceNum)),
     };
 
     const session = await stripe.checkout.sessions.create({

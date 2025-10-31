@@ -1,7 +1,13 @@
-// /api/create-booking.js
 export const config = { runtime: 'nodejs' };
 
 import { google } from 'googleapis';
+
+const TZ = process.env.TIMEZONE || 'America/Los_Angeles';
+const CAL_ID = process.env.CALENDAR_ID || process.env.GOOGLE_CALENDAR_ID || 'primary';
+
+const HOURS_RANGE = { start: 9, end: 22 };
+const MAX_PER_SLOT = 2;
+const MAX_PER_DAY  = 3;
 
 function cors(req, res) {
   const allow = (process.env.ALLOWED_ORIGINS || '')
@@ -17,6 +23,38 @@ function cors(req, res) {
   return false;
 }
 
+function pkgToHours(pkg) {
+  if (pkg === '50-150-5h') return 2;
+  if (pkg === '150-250-5h') return 2.5;
+  if (pkg === '250-350-6h') return 3;
+  return 2;
+}
+function opWindow(startISO, pkg){
+  const PREP = 1, CLEAN = 1;
+  const live = pkgToHours(pkg);
+  const start = new Date(startISO);
+  const opStart = new Date(start.getTime() - PREP * 3600_000);
+  const opEnd   = new Date(start.getTime() + (live + CLEAN) * 3600_000);
+  return { opStartISO: opStart.toISOString(), opEndISO: opEnd.toISOString(), live };
+}
+function dayRange(startISO){
+  const d = new Date(startISO);
+  const start = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  const end = new Date(start.getTime() + 24*3600_000);
+  return { dayStartISO: start.toISOString(), dayEndISO: end.toISOString() };
+}
+function localHour(iso, tz){
+  const parts = new Intl.DateTimeFormat('en-US',{ timeZone: tz, hour:'2-digit', hour12:false })
+    .formatToParts(new Date(iso));
+  return Number(parts.find(p=>p.type==='hour')?.value || '0');
+}
+function assertWithinHours(startISO, tz){
+  const hh = localHour(startISO, tz);
+  if (hh < HOURS_RANGE.start || hh >= HOURS_RANGE.end) {
+    const e = new Error(`outside_business_hours: ${hh}:00 not in ${HOURS_RANGE.start}:00–${HOURS_RANGE.end}:00 ${tz}`);
+    e.status = 409; throw e;
+  }
+}
 function pickTitle(mainBar, pkg) {
   const titleMap = {
     pancake: 'Mini Pancake',
@@ -31,12 +69,6 @@ function pickTitle(mainBar, pkg) {
     '250-350-6h': '250–350',
   };
   return `${titleMap[mainBar] || 'Service'} — ${sizeMap[pkg] || pkg}`;
-}
-function pkgToHours(pkg) {
-  if (pkg === '50-150-5h') return 2;
-  if (pkg === '150-250-5h') return 2.5;
-  if (pkg === '250-350-6h') return 3;
-  return 2;
 }
 
 export default async function handler(req, res) {
@@ -57,36 +89,57 @@ export default async function handler(req, res) {
 
     if (!startISO) return res.status(400).json({ ok:false, error:'Missing startISO (pick a slot)' });
 
-    // Google OAuth2 client via refresh token
+    // OAuth client
     const clientId     = process.env.GOOGLE_OAUTH_CLIENT_ID;
     const clientSecret = process.env.GOOGLE_OAUTH_CLIENT_SECRET;
     const redirectUri  = process.env.GOOGLE_OAUTH_REDIRECT_URI;
     const refreshToken = process.env.GOOGLE_OAUTH_REFRESH_TOKEN;
-
     if (!clientId || !clientSecret || !redirectUri || !refreshToken) {
       return res.status(500).json({ ok:false, error:'Missing Google OAuth env vars' });
     }
-
     const oAuth2Client = new google.auth.OAuth2(clientId, clientSecret, redirectUri);
     oAuth2Client.setCredentials({ refresh_token: refreshToken });
+    const cal = google.calendar({ version: 'v3', auth: oAuth2Client });
 
-    const calendarId = process.env.CALENDAR_ID || process.env.GOOGLE_CALENDAR_ID || 'primary';
-    const tz = process.env.TIMEZONE || 'America/Los_Angeles';
+    // Enforce hours + capacity BEFORE inserting
+    assertWithinHours(startISO, TZ);
 
-    const start = new Date(startISO);
-    const liveHours = pkgToHours(String(pkg));
-    const end = new Date(start.getTime() + liveHours * 60 * 60 * 1000);
+    const { opStartISO, opEndISO, live } = opWindow(startISO, String(pkg));
+    const { dayStartISO, dayEndISO } = dayRange(startISO);
 
+    const dayList = await cal.events.list({
+      calendarId: CAL_ID, timeMin: dayStartISO, timeMax: dayEndISO,
+      singleEvents: true, orderBy: 'startTime'
+    });
+    const dayCount = (dayList.data.items || []).filter(e => e.status !== 'cancelled').length;
+    if (dayCount >= MAX_PER_DAY){
+      return res.status(409).json({ ok:false, error:'capacity_day_limit', detail:'Max 3 events per day reached.' });
+    }
+
+    const overlapList = await cal.events.list({
+      calendarId: CAL_ID, timeMin: opStartISO, timeMax: opEndISO,
+      singleEvents: true, orderBy: 'startTime'
+    });
+    const overlapping = (overlapList.data.items || []).filter(ev=>{
+      if (ev.status === 'cancelled') return false;
+      const evStart = ev.start?.dateTime || ev.start?.date;
+      const evEnd   = ev.end?.dateTime   || ev.end?.date;
+      if (!evStart || !evEnd) return false;
+      return !(new Date(evEnd) <= new Date(opStartISO) || new Date(evStart) >= new Date(opEndISO));
+    }).length;
+    if (overlapping >= MAX_PER_SLOT){
+      return res.status(409).json({ ok:false, error:'capacity_overlap_limit', detail:'Max 2 concurrent events in the operational window.' });
+    }
+
+    // Build event (pretty description + totals)
     const summary = pickTitle(String(mainBar || ''), String(pkg || ''));
-
-    // ✅ Unified pretty description (with emojis + totals)
     const descriptionLines = [
       `👤 Client: ${fullName || ''}`,
       email ? `✉️ Email: ${email}` : '',
       phone ? `📞 Phone: ${phone}` : '',
       venue ? `📍 Venue: ${venue}` : '',
       '',
-      `🍫 Main bar: ${pickTitle(String(mainBar||''), String(pkg||''))}`,
+      `🍫 Main bar: ${summary}`,
       secondEnabled ? `➕ Second bar: ${String(secondBar||'-')} — ${String(secondSize||'-')}` : '',
       fountainEnabled ? `🫗 Chocolate fountain: ${String(fountainType||'-')} — ${String(fountainSize||'-')} ppl` : '',
       '',
@@ -94,30 +147,28 @@ export default async function handler(req, res) {
       `   • Total: $${Number(total||0).toFixed(0)}`,
       `   • Deposit: $${Number(deposit||0).toFixed(0)}`,
       `   • Balance: $${Number(balance||0).toFixed(0)}`,
-      (discountMode && discountMode!=='none')
-        ? `   • Discount: ${discountMode} ${discountValue||0}`
-        : '',
+      (discountMode && discountMode!=='none') ? `   • Discount: ${discountMode} ${discountValue||0}` : '',
       '',
       '⏱️ Timing:',
       `   • Prep: 1h before start`,
-      `   • Service: ${pkgToHours(String(pkg))}h`,
+      `   • Service: ${live}h`,
       `   • Clean up: +1h after`,
       '',
       `🤝 Affiliate: ${affiliateName || ''}${affiliateEmail ? ` <${affiliateEmail}>` : ''}`,
       pin ? `🔑 PIN: ${pin}` : ''
     ].filter(Boolean);
 
-    // Attendees
     const attendees = [];
     if (email && /\S+@\S+\.\S+/.test(email)) attendees.push({ email: email.trim() });
     if (affiliateEmail && /\S+@\S+\.\S+/.test(affiliateEmail)) attendees.push({ email: affiliateEmail.trim() });
 
+    // Block the full operational window
     const event = {
       summary,
       location: venue || '',
       description: descriptionLines.join('\n'),
-      start: { dateTime: start.toISOString(), timeZone: tz },
-      end:   { dateTime: end.toISOString(),   timeZone: tz },
+      start: { dateTime: opStartISO, timeZone: TZ },
+      end:   { dateTime: opEndISO,   timeZone: TZ },
       attendees,
       extendedProperties: {
         private: {
@@ -136,10 +187,8 @@ export default async function handler(req, res) {
       }
     };
 
-    const cal = google.calendar({ version: 'v3', auth: oAuth2Client });
-
     const created = await cal.events.insert({
-      calendarId,
+      calendarId: CAL_ID,
       requestBody: event,
       sendUpdates: 'all'
     });
@@ -147,7 +196,7 @@ export default async function handler(req, res) {
     const eventId = created?.data?.id || '';
     return res.status(200).json({ ok: true, eventId, noDeposit: !!noDeposit });
   } catch (e) {
-    const status = e?.response?.status || 500;
+    const status = e?.status || e?.response?.status || 500;
     const body = e?.response?.data || null;
     return res.status(status).json({
       ok: false,

@@ -30,7 +30,7 @@ export default async function handler(req, res) {
     const cancelUrl  = process.env.STRIPE_CANCEL_URL  || 'https://mannasnackbars.com/';
 
     const body = req.body || {};
-    // 🔒 force deposit mode
+    // force deposit mode
     const deposit = Number(body.deposit || 0);
     if (!(deposit > 0)) {
       return res.status(400).json({ ok: false, error: 'Deposit required. Enter a deposit > $0.' });
@@ -55,7 +55,7 @@ export default async function handler(req, res) {
     };
     const title = `${titleMap[mainBar] || 'Service'} — ${sizeMap[pkg] || pkg} (Deposit)`;
 
-    // Include metadata for webhook reconciliation (optional)
+    // 🔹 Pasamos Totals al webhook para que pinte igual
     const metadata = {
       pkg, mainBar,
       fullName: clientName,
@@ -67,6 +67,9 @@ export default async function handler(req, res) {
       affiliateEmail: String(body.affiliateEmail || ''),
       pin: String(body.pin || ''),
       payMode: 'deposit',
+      total: String(body.total ?? ''),     // 💰
+      deposit: String(body.deposit ?? ''), // 💰
+      balance: String(body.balance ?? ''), // 💰
     };
 
     const session = await stripe.checkout.sessions.create({

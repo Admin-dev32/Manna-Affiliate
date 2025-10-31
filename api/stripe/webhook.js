@@ -1,8 +1,14 @@
-// /api/stripe/webhook.js
 export const config = { runtime: 'nodejs' };
 
 import Stripe from 'stripe';
 import { getOAuthCalendar } from '../_google.js';
+
+const TZ = process.env.TIMEZONE || 'America/Los_Angeles';
+const CAL_ID = process.env.CALENDAR_ID || process.env.GOOGLE_CALENDAR_ID || 'primary';
+
+const HOURS_RANGE = { start: 9, end: 22 };
+const MAX_PER_SLOT = 2;
+const MAX_PER_DAY  = 3;
 
 function hoursFromPkg(pkg) {
   if (pkg === '50-150-5h') return 2;
@@ -30,6 +36,31 @@ function pkgLabel(v) {
 }
 function safeStr(v, fb = '') { return (typeof v === 'string' ? v : fb).trim(); }
 
+function opWindow(startISO, pkg){
+  const PREP = 1, CLEAN = 1;
+  const live = hoursFromPkg(pkg);
+  const start = new Date(startISO);
+  const opStart = new Date(start.getTime() - PREP * 3600_000);
+  const opEnd   = new Date(start.getTime() + (live + CLEAN) * 3600_000);
+  return { opStartISO: opStart.toISOString(), opEndISO: opEnd.toISOString(), live };
+}
+function dayRange(startISO){
+  const d = new Date(startISO);
+  const start = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  const end = new Date(start.getTime() + 24*3600_000);
+  return { dayStartISO: start.toISOString(), dayEndISO: end.toISOString() };
+}
+function localHour(iso, tz){
+  const parts = new Intl.DateTimeFormat('en-US',{ timeZone: tz, hour:'2-digit', hour12:false })
+    .formatToParts(new Date(iso));
+  return Number(parts.find(p=>p.type==='hour')?.value || '0');
+}
+function isWithinHours(startISO, tz){
+  const hh = localHour(startISO, tz);
+  return (hh >= HOURS_RANGE.start && hh < HOURS_RANGE.end);
+}
+
+// Read raw body for Stripe signature verification
 async function readRawBody(req) {
   const chunks = [];
   for await (const chunk of req) chunks.push(chunk);
@@ -81,11 +112,43 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true, skipped: 'missing_metadata' });
     }
 
-    // --- Build pretty description with totals
+    // Hours + capacity guard (return 200 with ok:false to stop retries but deny booking)
+    if (!isWithinHours(startISO, TZ)) {
+      return res.status(200).json({ ok:false, error:'outside_business_hours' });
+    }
+
+    const { opStartISO, opEndISO, live } = opWindow(startISO, pkg);
+    const { calendar } = await getOAuthCalendar();
+
+    const { dayStartISO, dayEndISO } = dayRange(startISO);
+    const dayList = await calendar.events.list({
+      calendarId: CAL_ID, timeMin: dayStartISO, timeMax: dayEndISO,
+      singleEvents: true, orderBy: 'startTime'
+    });
+    const dayCount = (dayList.data.items || []).filter(e => e.status !== 'cancelled').length;
+    if (dayCount >= MAX_PER_DAY){
+      return res.status(200).json({ ok:false, error:'capacity_day_limit' });
+    }
+
+    const overlapList = await calendar.events.list({
+      calendarId: CAL_ID, timeMin: opStartISO, timeMax: opEndISO,
+      singleEvents: true, orderBy: 'startTime'
+    });
+    const overlapping = (overlapList.data.items || []).filter(ev=>{
+      if (ev.status === 'cancelled') return false;
+      const evStart = ev.start?.dateTime || ev.start?.date;
+      const evEnd   = ev.end?.dateTime   || ev.end?.date;
+      if (!evStart || !evEnd) return false;
+      return !(new Date(evEnd) <= new Date(opStartISO) || new Date(evStart) >= new Date(opEndISO));
+    }).length;
+    if (overlapping >= MAX_PER_SLOT){
+      return res.status(200).json({ ok:false, error:'capacity_overlap_limit' });
+    }
+
+    // Build pretty description with totals
     const depositPaid = Number(md.deposit || Math.round((session.amount_total || 0) / 100));
     const totalAll    = Number(md.total   || 0);
     const balanceDue  = Number(md.balance || Math.max(0, totalAll - depositPaid));
-
     const desc = [
       `👤 Client: ${fullName}`,
       session.customer_details?.email ? `✉️ Email: ${session.customer_details.email}` : '',
@@ -100,25 +163,13 @@ export default async function handler(req, res) {
       '',
       '⏱️ Timing:',
       `   • Prep: 1h before start`,
-      `   • Service: ${hoursFromPkg(pkg)}h`,
+      `   • Service: ${live}h`,
       `   • Clean up: +1h after`,
       '',
       affiliateName ? `🤝 Affiliate: ${affiliateName}` : ''
     ].filter(Boolean).join('\n');
 
-    const end = new Date(new Date(startISO).getTime() + (hoursFromPkg(pkg) * 3600 * 1000)).toISOString();
-
-    // Attendees
-    const attendees = [];
-    const checkoutEmail = safeStr(session.customer_details?.email);
-    if (checkoutEmail) attendees.push({ email: checkoutEmail });
-    if (affiliateEmail) attendees.push({ email: affiliateEmail });
-
-    const title = `Manna Snack Bars — ${barLabel(mainBar)} — ${pkgLabel(pkg)} — ${fullName}`;
-    const calendarId = process.env.GOOGLE_CALENDAR_ID || 'primary';
-    const { calendar } = await getOAuthCalendar();
-
-    // Idempotency via session.id stored in private extended properties
+    // Idempotency via session.id
     const sessionId = safeStr(session.id);
     if (sessionId) {
       const day = new Date(startISO);
@@ -126,7 +177,7 @@ export default async function handler(req, res) {
       const dayEnd   = new Date(day.getFullYear(), day.getMonth(), day.getDate(), 23, 59, 59).toISOString();
 
       const existing = await calendar.events.list({
-        calendarId,
+        calendarId: CAL_ID,
         timeMin: dayStart,
         timeMax: dayEnd,
         singleEvents: true,
@@ -138,27 +189,36 @@ export default async function handler(req, res) {
       }
     }
 
+    // Block the full operational window
+    const title = `Manna Snack Bars — ${barLabel(mainBar)} — ${pkgLabel(pkg)} — ${fullName}`;
     const eventBody = {
       summary: title,
       location: venue || undefined,
       description: desc,
-      start: { dateTime: startISO },
-      end:   { dateTime: end },
-      attendees: attendees.length ? attendees : undefined,
+      start: { dateTime: opStartISO },
+      end:   { dateTime: opEndISO },
+      attendees: (() => {
+        const list = [];
+        const checkoutEmail = safeStr(session.customer_details?.email);
+        if (checkoutEmail) list.push({ email: checkoutEmail });
+        if (affiliateEmail) list.push({ email: affiliateEmail });
+        return list.length ? list : undefined;
+      })(),
       guestsCanSeeOtherGuests: true,
       reminders: { useDefault: true },
       extendedProperties: { private: { sessionId: sessionId || '' } }
     };
 
     const resp = await calendar.events.insert({
-      calendarId,
-      sendUpdates: attendees.length ? 'all' : 'none',
+      calendarId: CAL_ID,
+      sendUpdates: eventBody.attendees ? 'all' : 'none',
       requestBody: eventBody
     });
 
     return res.status(200).json({ ok: true, created: resp.data?.id || null });
   } catch (err) {
     console.error('webhook create-event error:', err?.response?.data || err);
+    // 200 so Stripe doesn't retry forever; we include ok:false for your logs
     return res.status(200).json({ ok: false, error: 'create_event_failed', detail: String(err?.message || err) });
   }
 }

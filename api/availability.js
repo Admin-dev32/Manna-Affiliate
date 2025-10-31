@@ -1,15 +1,16 @@
 // /api/availability.js
 export const config = { runtime: 'nodejs' };
 
-import { applyCors, preflight } from './_cors.js';
+import { applyCors, handlePreflight } from './_cors.js';
 import { getOAuthCalendar } from './_google.js';
 
 // Business rules
-const HOURS_RANGE = { start: 9, end: 22 }; // 09:00 → 22:00 candidate starts (local time)
+const HOURS_RANGE = { start: 9, end: 22 }; // 09:00 → 22:00 local (America/Los_Angeles)
 const PREP_HOURS  = 1;                     // 1h before
 const CLEAN_HOURS = 1;                     // 1h after
 const MAX_PER_SLOT = 2;                    // max 2 events colliding the full service block
 const MAX_PER_DAY  = 3;                    // max 3 events per calendar day
+const TZ = process.env.TIMEZONE || 'America/Los_Angeles';
 
 function hoursFromPkg(pkg) {
   if (pkg === '50-150-5h') return 2;
@@ -18,12 +19,23 @@ function hoursFromPkg(pkg) {
   return 2;
 }
 
-// Construye un Date local (zona LA) y devuelve ISO UTC equivalente
-function localISO(ymd, hour) {
+// Figure out LA offset (“-07:00” PDT or “-08:00” PST) for a given date
+function laOffsetForYMD(ymd) {
   const [y, m, d] = String(ymd).split('-').map(Number);
-  const dt = new Date(y, m - 1, d, hour, 0, 0, 0); // hora local del server
-  return dt.toISOString();
+  const noonUTC = new Date(Date.UTC(y, m - 1, d, 12, 0, 0));
+  const parts = new Intl.DateTimeFormat('en-US', { timeZone: TZ, timeZoneName: 'short' })
+    .formatToParts(noonUTC);
+  const abbr = (parts.find(p => p.type === 'timeZoneName')?.value || '').toUpperCase();
+  return abbr.includes('PDT') ? '-07:00' : '-08:00';
 }
+
+// Build RFC3339 with LA offset (no DST bugs)
+function startISOFor(ymd, hour) {
+  const pad = n => String(n).padStart(2, '0');
+  const offset = laOffsetForYMD(ymd);
+  return `${ymd}T${pad(hour)}:00:00${offset}`;
+}
+
 function fullBlock(startISO, liveHours) {
   const start = new Date(startISO);
   const blockStart = new Date(start.getTime() - PREP_HOURS * 3600e3);
@@ -33,38 +45,26 @@ function fullBlock(startISO, liveHours) {
 
 export default async function handler(req, res) {
   // CORS
-  const allow = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
-  const origin = req.headers.origin || '';
-  const okOrigin = allow.length ? allow.includes(origin) : true;
-
-  if (req.method === 'OPTIONS') {
-    res.setHeader('Access-Control-Allow-Origin', okOrigin ? origin : '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-    res.setHeader('Vary', 'Origin');
-    return res.status(204).end();
-  }
-  res.setHeader('Access-Control-Allow-Origin', okOrigin ? origin : '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-  res.setHeader('Vary', 'Origin');
-  if (preflight(req, res)) return;
-  applyCors(res);
+  if (handlePreflight(req, res)) return;
+  applyCors(req, res);
 
   try {
+    if (req.method !== 'GET') {
+      return res.status(405).json({ error: 'method_not_allowed' });
+    }
+
     const { date, pkg } = req.query || {};
     if (!date) return res.status(400).json({ error: 'date required (YYYY-MM-DD)' });
 
-    const tz = process.env.TIMEZONE || 'America/Los_Angeles';
     const calId = process.env.CALENDAR_ID || process.env.GOOGLE_CALENDAR_ID || 'primary';
     const liveHours = hoursFromPkg(String(pkg || ''));
 
-    // ⚠️ OJO: getOAuthCalendar() retorna { calendar, auth }
+    // getOAuthCalendar returns { calendar, auth }
     const { calendar } = await getOAuthCalendar();
 
-    // Pull all events for the day (00:00–23:59 local)
-    const dayStartISO = localISO(date, 0);
-    const dayEndISO   = localISO(date, 23);
+    // Day range in LA (00:00–23:59 with correct offset)
+    const dayStartISO = startISOFor(date, 0);
+    const dayEndISO   = startISOFor(date, 23);
 
     const rsp = await calendar.events.list({
       calendarId: calId,
@@ -72,34 +72,37 @@ export default async function handler(req, res) {
       timeMax: dayEndISO,
       singleEvents: true,
       orderBy: 'startTime',
-      maxResults: 250
+      maxResults: 250,
     });
 
     const events = (rsp.data.items || [])
       .filter(e => e.status !== 'cancelled')
       .map(e => ({
         start: new Date(e.start?.dateTime || e.start?.date),
-        end:   new Date(e.end?.dateTime   || e.end?.date)
+        end:   new Date(e.end?.dateTime   || e.end?.date),
       }));
 
-    // Hard-cap del día
+    // Hard-cap: 3 events per day
     if (events.length >= MAX_PER_DAY) {
       return res.status(200).json({ slots: [] });
     }
 
-    // Genera candidatos 9–22 y filtra por capacidad de la ventana operacional
+    // Generate 9–22 candidates and allow only if <2 overlaps across the full operational window
     const now = new Date();
     const slots = [];
+
     for (let h = HOURS_RANGE.start; h <= HOURS_RANGE.end; h++) {
-      const startISO = localISO(date, h);
+      const startISO = startISOFor(date, h);
       if (new Date(startISO) < now) continue;
 
       const { blockStart, blockEnd } = fullBlock(startISO, liveHours);
-      const overlapping = events.filter(ev => !(ev.end <= blockStart || ev.start >= blockEnd)).length;
+      const overlapping = events.filter(
+        ev => !(ev.end <= blockStart || ev.start >= blockEnd)
+      ).length;
 
       if (overlapping < MAX_PER_SLOT) {
-        // El HTML espera {hour}
-        slots.push({ hour: h });
+        // ✅ Frontend expects { startISO }
+        slots.push({ startISO });
       }
     }
 

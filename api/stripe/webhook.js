@@ -20,21 +20,16 @@ function barLabel(v) {
   };
   return map[v] || v || 'Service';
 }
-function sizeLabel(v) {
+function pkgLabel(v) {
   const map = {
-    '50-150-5h': '50–150',
-    '150-250-5h': '150–250',
-    '250-350-6h': '250–350',
+    '50-150-5h': '50–150 (5h window)',
+    '150-250-5h': '150–250 (5h window)',
+    '250-350-6h': '250–350 (6h window)',
   };
   return map[v] || v || '';
 }
-function computeEndISO(startISO, pkg) {
-  const live = hoursFromPkg(pkg);
-  const CLEAN_HOURS = 1;
-  const start = new Date(startISO);
-  const end = new Date(start.getTime() + (live + CLEAN_HOURS) * 3600 * 1000);
-  return end.toISOString();
-}
+function safeStr(v, fb = '') { return (typeof v === 'string' ? v : fb).trim(); }
+
 async function readRawBody(req) {
   const chunks = [];
   for await (const chunk of req) chunks.push(chunk);
@@ -44,9 +39,9 @@ async function readRawBody(req) {
 export default async function handler(req, res) {
   if (req.method !== 'POST') { res.status(405).send('Method Not Allowed'); return; }
 
-  const stripeSecret = process.env.STRIPE_SECRET_KEY;
+  const stripeSecret  = process.env.STRIPE_SECRET_KEY;
   const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
-  if (!stripeSecret || !webhookSecret) { console.error('Missing Stripe secrets.'); res.status(500).send('Server misconfigured'); return; }
+  if (!stripeSecret || !webhookSecret) { res.status(500).send('Server misconfigured'); return; }
 
   const stripe = new Stripe(stripeSecret, { apiVersion: '2022-11-15' });
 
@@ -73,35 +68,58 @@ export default async function handler(req, res) {
     }
 
     const md = session.metadata || {};
-    const pkg = String(md.pkg || '');
-    const mainBar = String(md.mainBar || '');
-    const fullName = String(md.fullName || session.customer_details?.name || 'Client');
-    const venue = String(md.venue || '');
-    const startISO = String(md.startISO || '');
-    const affiliateEmail = String(md.affiliateEmail || '');
-    const affiliateName = String(md.affiliateName || '');
-    const total   = Number(md.total || 0);
-    const deposit = Number(md.deposit || 0);
-    const balance = Number(md.balance || 0);
+    const pkg = safeStr(md.pkg);
+    const mainBar = safeStr(md.mainBar);
+    const fullName = safeStr(md.fullName || session.customer_details?.name || 'Client');
+    const venue = safeStr(md.venue);
+    const startISO = safeStr(md.startISO);
+    const affiliateEmail = safeStr(md.affiliateEmail);
+    const affiliateName  = safeStr(md.affiliateName);
 
     if (!startISO || !pkg || !mainBar || !fullName) {
-      console.error('Missing required booking fields in metadata:', md);
+      console.error('Missing required fields in metadata:', md);
       return res.status(200).json({ ok: true, skipped: 'missing_metadata' });
     }
 
-    const endISO = computeEndISO(startISO, pkg);
+    // --- Build pretty description with totals
+    const depositPaid = Number(md.deposit || Math.round((session.amount_total || 0) / 100));
+    const totalAll    = Number(md.total   || 0);
+    const balanceDue  = Number(md.balance || Math.max(0, totalAll - depositPaid));
+
+    const desc = [
+      `👤 Client: ${fullName}`,
+      session.customer_details?.email ? `✉️ Email: ${session.customer_details.email}` : '',
+      venue ? `📍 Venue: ${venue}` : '',
+      '',
+      `🍫 Main bar: ${barLabel(mainBar)} — ${pkgLabel(pkg)}`,
+      '',
+      '💰 Totals:',
+      `   • Total: $${totalAll ? totalAll.toFixed(0) : '—'}`,
+      `   • Deposit: $${depositPaid.toFixed(0)} (paid)`,
+      `   • Balance: $${balanceDue ? balanceDue.toFixed(0) : '—'}`,
+      '',
+      '⏱️ Timing:',
+      `   • Prep: 1h before start`,
+      `   • Service: ${hoursFromPkg(pkg)}h`,
+      `   • Clean up: +1h after`,
+      '',
+      affiliateName ? `🤝 Affiliate: ${affiliateName}` : ''
+    ].filter(Boolean).join('\n');
+
+    const end = new Date(new Date(startISO).getTime() + (hoursFromPkg(pkg) * 3600 * 1000)).toISOString();
+
+    // Attendees
     const attendees = [];
-    const checkoutEmail = session.customer_details?.email ? String(session.customer_details.email) : '';
+    const checkoutEmail = safeStr(session.customer_details?.email);
     if (checkoutEmail) attendees.push({ email: checkoutEmail });
     if (affiliateEmail) attendees.push({ email: affiliateEmail });
 
-    const title = `Manna Snack Bars — ${barLabel(mainBar)} — ${sizeLabel(pkg)} — ${fullName}`;
-
-    const calendarId = process.env.CALENDAR_ID || process.env.GOOGLE_CALENDAR_ID || 'primary';
+    const title = `Manna Snack Bars — ${barLabel(mainBar)} — ${pkgLabel(pkg)} — ${fullName}`;
+    const calendarId = process.env.GOOGLE_CALENDAR_ID || 'primary';
     const { calendar } = await getOAuthCalendar();
 
-    // Idempotencia por session.id en extendedProperties
-    const sessionId = String(session.id || '');
+    // Idempotency via session.id stored in private extended properties
+    const sessionId = safeStr(session.id);
     if (sessionId) {
       const day = new Date(startISO);
       const dayStart = new Date(day.getFullYear(), day.getMonth(), day.getDate(), 0, 0, 0).toISOString();
@@ -120,46 +138,27 @@ export default async function handler(req, res) {
       }
     }
 
-    const desc = [
-      `📦 Package: ${sizeLabel(pkg)}`,
-      `🍫 Main bar: ${barLabel(mainBar)}`,
-      venue ? `📍 Venue: ${venue}` : '',
-      '',
-      `⏱️ Prep: 1h before start`,
-      `⏱️ Service: ${hoursFromPkg(pkg)}h (+ 1h cleaning)`,
-      '',
-      `💰 Totals:`,
-      `   • Total: $${Number(total||0).toFixed(0)}`,
-      `   • Deposit: $${Number(deposit||0).toFixed(0)}`,
-      `   • Balance: $${Number(balance||0).toFixed(0)}`,
-      '',
-      `👤 Affiliate: ${affiliateName || ''}`,
-    ].filter(Boolean).join('\n');
-
     const eventBody = {
       summary: title,
       location: venue || undefined,
       description: desc,
       start: { dateTime: startISO },
-      end:   { dateTime: endISO },
+      end:   { dateTime: end },
       attendees: attendees.length ? attendees : undefined,
       guestsCanSeeOtherGuests: true,
       reminders: { useDefault: true },
-      extendedProperties: {
-        private: { sessionId }
-      }
+      extendedProperties: { private: { sessionId: sessionId || '' } }
     };
 
-    const created = await calendar.events.insert({
+    const resp = await calendar.events.insert({
       calendarId,
       sendUpdates: attendees.length ? 'all' : 'none',
       requestBody: eventBody
     });
 
-    return res.status(200).json({ ok: true, created: created.data?.id || null });
+    return res.status(200).json({ ok: true, created: resp.data?.id || null });
   } catch (err) {
     console.error('webhook create-event error:', err?.response?.data || err);
-    // 200 para que Stripe no haga retry infinito (ya validaste capacidad antes)
     return res.status(200).json({ ok: false, error: 'create_event_failed', detail: String(err?.message || err) });
   }
 }

@@ -1,15 +1,14 @@
-// /api/availability.js
 export const config = { runtime: 'nodejs' };
 
 import { applyCors, handlePreflight } from './_cors.js';
 import { getOAuthCalendar } from './_google.js';
 
 // Business rules
-const HOURS_RANGE = { start: 9, end: 22 }; // 09:00 → 22:00 local (America/Los_Angeles)
-const PREP_HOURS  = 1;                     // 1h before
-const CLEAN_HOURS = 1;                     // 1h after
-const MAX_PER_SLOT = 2;                    // max 2 events colliding the full service block
-const MAX_PER_DAY  = 3;                    // max 3 events per calendar day
+const HOURS_RANGE = { start: 9, end: 22 }; // allowed service START hours: 09:00..21:59 (last candidate = 21:00)
+const PREP_HOURS  = 1;
+const CLEAN_HOURS = 1;
+const MAX_PER_SLOT = 2;
+const MAX_PER_DAY  = 3;
 const TZ = process.env.TIMEZONE || 'America/Los_Angeles';
 
 function hoursFromPkg(pkg) {
@@ -19,7 +18,7 @@ function hoursFromPkg(pkg) {
   return 2;
 }
 
-// Figure out LA offset (“-07:00” PDT or “-08:00” PST) for a given date
+// Detect PDT/PST offset (-07:00 or -08:00) for given date
 function laOffsetForYMD(ymd) {
   const [y, m, d] = String(ymd).split('-').map(Number);
   const noonUTC = new Date(Date.UTC(y, m - 1, d, 12, 0, 0));
@@ -28,30 +27,23 @@ function laOffsetForYMD(ymd) {
   const abbr = (parts.find(p => p.type === 'timeZoneName')?.value || '').toUpperCase();
   return abbr.includes('PDT') ? '-07:00' : '-08:00';
 }
-
-// Build RFC3339 with LA offset (no DST bugs)
-function startISOFor(ymd, hour) {
-  const pad = n => String(n).padStart(2, '0');
-  const offset = laOffsetForYMD(ymd);
-  return `${ymd}T${pad(hour)}:00:00${offset}`;
-}
+const pad = n => String(n).padStart(2, '0');
+function isoAt(ymd, hour) { return `${ymd}T${pad(hour)}:00:00${laOffsetForYMD(ymd)}`; }
 
 function fullBlock(startISO, liveHours) {
   const start = new Date(startISO);
-  const blockStart = new Date(start.getTime() - PREP_HOURS * 3600e3);
-  const blockEnd   = new Date(start.getTime() + (liveHours + CLEAN_HOURS) * 3600e3);
-  return { blockStart, blockEnd };
+  return {
+    blockStart: new Date(start.getTime() - PREP_HOURS * 3600e3),
+    blockEnd:   new Date(start.getTime() + (liveHours + CLEAN_HOURS) * 3600e3),
+  };
 }
 
 export default async function handler(req, res) {
-  // CORS
   if (handlePreflight(req, res)) return;
   applyCors(req, res);
 
   try {
-    if (req.method !== 'GET') {
-      return res.status(405).json({ error: 'method_not_allowed' });
-    }
+    if (req.method !== 'GET') return res.status(405).json({ error: 'method_not_allowed' });
 
     const { date, pkg } = req.query || {};
     if (!date) return res.status(400).json({ error: 'date required (YYYY-MM-DD)' });
@@ -59,12 +51,11 @@ export default async function handler(req, res) {
     const calId = process.env.CALENDAR_ID || process.env.GOOGLE_CALENDAR_ID || 'primary';
     const liveHours = hoursFromPkg(String(pkg || ''));
 
-    // getOAuthCalendar returns { calendar, auth }
     const { calendar } = await getOAuthCalendar();
 
-    // Day range in LA (00:00–23:59 with correct offset)
-    const dayStartISO = startISOFor(date, 0);
-    const dayEndISO   = startISOFor(date, 23);
+    // Pull events for the local day
+    const dayStartISO = isoAt(date, 0);
+    const dayEndISO   = isoAt(date, 23);
 
     const rsp = await calendar.events.list({
       calendarId: calId,
@@ -82,17 +73,16 @@ export default async function handler(req, res) {
         end:   new Date(e.end?.dateTime   || e.end?.date),
       }));
 
-    // Hard-cap: 3 events per day
+    // Hard cap per day
     if (events.length >= MAX_PER_DAY) {
       return res.status(200).json({ slots: [] });
     }
 
-    // Generate 9–22 candidates and allow only if <2 overlaps across the full operational window
+    // Candidates strictly 09:00..21:00 (so service starts in-window)
     const now = new Date();
     const slots = [];
-
-    for (let h = HOURS_RANGE.start; h <= HOURS_RANGE.end; h++) {
-      const startISO = startISOFor(date, h);
+    for (let h = HOURS_RANGE.start; h < HOURS_RANGE.end; h++) { // NOTE: < end (not <=)
+      const startISO = isoAt(date, h);
       if (new Date(startISO) < now) continue;
 
       const { blockStart, blockEnd } = fullBlock(startISO, liveHours);
@@ -101,7 +91,6 @@ export default async function handler(req, res) {
       ).length;
 
       if (overlapping < MAX_PER_SLOT) {
-        // ✅ Frontend expects { startISO }
         slots.push({ startISO });
       }
     }
@@ -109,6 +98,6 @@ export default async function handler(req, res) {
     return res.status(200).json({ slots });
   } catch (e) {
     console.error('availability error:', e?.response?.data || e);
-    return res.status(500).json({ error: 'availability_failed', detail: String(e.message || e) });
+    return res.status(500).json({ error: 'availability_failed', detail: String(e?.message || e) });
   }
 }

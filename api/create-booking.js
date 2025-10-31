@@ -17,21 +17,33 @@ function cors(req, res) {
   return false;
 }
 
-function titleMap(v){ return ({
-  pancake:'Mini Pancake', maruchan:'Maruchan', esquites:'Esquites (Corn Cups)',
-  snack:'Manna Snack — Classic', tostiloco:'Tostiloco (Premium)'
-})[v] || 'Service'; }
-function sizeMap(v){ return ({
-  '50-150-5h':'50–150', '150-250-5h':'150–250', '250-350-6h':'250–350'
-})[v] || v; }
+function pickTitle(mainBar, pkg) {
+  const titleMap = {
+    pancake: 'Mini Pancake',
+    maruchan: 'Maruchan',
+    esquites: 'Esquites (Corn Cups)',
+    snack: 'Manna Snack — Classic',
+    tostiloco: 'Tostiloco (Premium)',
+  };
+  const sizeMap = {
+    '50-150-5h': '50–150',
+    '150-250-5h': '150–250',
+    '250-350-6h': '250–350',
+  };
+  return `${titleMap[mainBar] || 'Service'} — ${sizeMap[pkg] || pkg}`;
+}
+function pkgToHours(pkg) {
+  if (pkg === '50-150-5h') return 2;
+  if (pkg === '150-250-5h') return 2.5;
+  if (pkg === '250-350-6h') return 3;
+  return 2;
+}
 
-function pkgToHours(pkg){ if(pkg==='50-150-5h') return 2; if(pkg==='150-250-5h') return 2.5; if(pkg==='250-350-6h') return 3; return 2; }
-
-export default async function handler(req, res){
+export default async function handler(req, res) {
   if (cors(req, res)) return;
   if (req.method !== 'POST') return res.status(405).json({ ok:false, error:'Method not allowed' });
 
-  try{
+  try {
     const {
       fullName, email, phone, venue,
       dateISO, startISO, pkg, mainBar,
@@ -45,6 +57,7 @@ export default async function handler(req, res){
 
     if (!startISO) return res.status(400).json({ ok:false, error:'Missing startISO (pick a slot)' });
 
+    // Google OAuth2 client via refresh token
     const clientId     = process.env.GOOGLE_OAUTH_CLIENT_ID;
     const clientSecret = process.env.GOOGLE_OAUTH_CLIENT_SECRET;
     const redirectUri  = process.env.GOOGLE_OAUTH_REDIRECT_URI;
@@ -62,31 +75,39 @@ export default async function handler(req, res){
 
     const start = new Date(startISO);
     const liveHours = pkgToHours(String(pkg));
-    const end = new Date(start.getTime() + liveHours * 3600 * 1000);
+    const end = new Date(start.getTime() + liveHours * 60 * 60 * 1000);
 
-    const summary = `Manna Snack Bars — ${titleMap(String(mainBar||''))} — ${sizeMap(String(pkg||''))} — ${String(fullName||'')}`;
+    const summary = pickTitle(String(mainBar || ''), String(pkg || ''));
 
-    // 💄 Formato igual al webhook + Totals
-    const lines = [
-      `📦 Package: ${sizeMap(String(pkg||''))}`,
-      `🍫 Main bar: ${titleMap(String(mainBar||''))}`,
+    // ✅ Unified pretty description (with emojis + totals)
+    const descriptionLines = [
+      `👤 Client: ${fullName || ''}`,
+      email ? `✉️ Email: ${email}` : '',
+      phone ? `📞 Phone: ${phone}` : '',
       venue ? `📍 Venue: ${venue}` : '',
       '',
-      `⏱️ Prep: 1h before start`,
-      `⏱️ Service: ${liveHours}h (+ 1h cleaning)`,
+      `🍫 Main bar: ${pickTitle(String(mainBar||''), String(pkg||''))}`,
+      secondEnabled ? `➕ Second bar: ${String(secondBar||'-')} — ${String(secondSize||'-')}` : '',
+      fountainEnabled ? `🫗 Chocolate fountain: ${String(fountainType||'-')} — ${String(fountainSize||'-')} ppl` : '',
       '',
-      `💰 Totals:`,
+      '💰 Totals:',
       `   • Total: $${Number(total||0).toFixed(0)}`,
       `   • Deposit: $${Number(deposit||0).toFixed(0)}`,
       `   • Balance: $${Number(balance||0).toFixed(0)}`,
+      (discountMode && discountMode!=='none')
+        ? `   • Discount: ${discountMode} ${discountValue||0}`
+        : '',
       '',
-      notes ? `📝 Notes: ${notes}` : '',
+      '⏱️ Timing:',
+      `   • Prep: 1h before start`,
+      `   • Service: ${pkgToHours(String(pkg))}h`,
+      `   • Clean up: +1h after`,
       '',
-      `👤 Affiliate: ${affiliateName || ''}${affiliateEmail ? ` <${affiliateEmail}>` : ''}${pin ? ` (PIN: ${pin})` : ''}`,
-      '',
-      `👤 Client: ${fullName || ''}${email ? ` <${email}>` : ''}${phone ? ` | ${phone}` : ''}`,
+      `🤝 Affiliate: ${affiliateName || ''}${affiliateEmail ? ` <${affiliateEmail}>` : ''}`,
+      pin ? `🔑 PIN: ${pin}` : ''
     ].filter(Boolean);
 
+    // Attendees
     const attendees = [];
     if (email && /\S+@\S+\.\S+/.test(email)) attendees.push({ email: email.trim() });
     if (affiliateEmail && /\S+@\S+\.\S+/.test(affiliateEmail)) attendees.push({ email: affiliateEmail.trim() });
@@ -94,7 +115,7 @@ export default async function handler(req, res){
     const event = {
       summary,
       location: venue || '',
-      description: lines.join('\n'),
+      description: descriptionLines.join('\n'),
       start: { dateTime: start.toISOString(), timeZone: tz },
       end:   { dateTime: end.toISOString(),   timeZone: tz },
       attendees,
@@ -123,7 +144,8 @@ export default async function handler(req, res){
       sendUpdates: 'all'
     });
 
-    return res.status(200).json({ ok: true, eventId: created?.data?.id || '', noDeposit: !!noDeposit });
+    const eventId = created?.data?.id || '';
+    return res.status(200).json({ ok: true, eventId, noDeposit: !!noDeposit });
   } catch (e) {
     const status = e?.response?.status || 500;
     const body = e?.response?.data || null;

@@ -1,4 +1,3 @@
-// /api/create-event.js
 export const config = { runtime: 'nodejs' };
 
 import { applyCors, handlePreflight } from './_cors.js';
@@ -8,9 +7,9 @@ import { resolveAffiliate } from './_affiliates.js';
 const TZ = process.env.TIMEZONE || 'America/Los_Angeles';
 const CAL_ID = process.env.CALENDAR_ID || process.env.GOOGLE_CALENDAR_ID || 'primary';
 
-const HOURS_RANGE = { start: 9, end: 22 }; // 9:00 → 22:00 local wall time
-const MAX_PER_SLOT = 2;                    // max concurrent within op window
-const MAX_PER_DAY  = 3;                    // max per calendar day
+const HOURS_RANGE = { start: 9, end: 22 }; // allowed SERVICE start: 9..21
+const MAX_PER_SLOT = 2;
+const MAX_PER_DAY  = 3;
 
 const s = (v, fb='') => (typeof v === 'string' ? v : fb).trim();
 
@@ -42,7 +41,7 @@ function opWindow(startISO, pkg){
   const start = new Date(startISO);
   const opStart = new Date(start.getTime() - PREP * 3600_000);
   const opEnd   = new Date(start.getTime() + (live + CLEAN) * 3600_000);
-  return { opStartISO: opStart.toISOString(), opEndISO: opEnd.toISOString() };
+  return { opStartISO: opStart.toISOString(), opEndISO: opEnd.toISOString(), live };
 }
 function dayRange(startISO){
   const d = new Date(startISO);
@@ -51,16 +50,13 @@ function dayRange(startISO){
   return { dayStartISO: start.toISOString(), dayEndISO: end.toISOString() };
 }
 function localHour(iso, tz){
-  const dt = new Date(iso);
-  const parts = new Intl.DateTimeFormat('en-US',{
-    timeZone: tz, hour:'2-digit', hour12:false
-  }).formatToParts(dt);
-  const hh = Number(parts.find(p=>p.type==='hour')?.value || '0');
-  return hh;
+  const parts = new Intl.DateTimeFormat('en-US',{ timeZone: tz, hour:'2-digit', hour12:false })
+    .formatToParts(new Date(iso));
+  return Number(parts.find(p=>p.type==='hour')?.value || '0');
 }
 function assertWithinHours(startISO, tz){
   const hh = localHour(startISO, tz);
-  if (hh < HOURS_RANGE.start || hh > HOURS_RANGE.end){
+  if (hh < HOURS_RANGE.start || hh >= HOURS_RANGE.end) {
     const msg = `outside_business_hours: ${hh}:00 not in ${HOURS_RANGE.start}:00–${HOURS_RANGE.end}:00 ${tz}`;
     const e = new Error(msg); e.status = 409; throw e;
   }
@@ -88,33 +84,27 @@ export default async function handler(req, res){
       return res.status(400).json({ ok:false, error:'missing_fields' });
     }
 
-    // ✅ Enforce 9:00–22:00 local
+    // Enforce allowed SERVICE start hours
     assertWithinHours(startISO, TZ);
 
-    const { opStartISO, opEndISO } = opWindow(startISO, pkg);
+    const { opStartISO, opEndISO, live } = opWindow(startISO, pkg);
     const { calendar } = await getOAuthCalendar();
 
-    // 1) Max 3 events/day
+    // 1) Max per day
     const { dayStartISO, dayEndISO } = dayRange(startISO);
     const dayList = await calendar.events.list({
-      calendarId: CAL_ID,
-      timeMin: dayStartISO,
-      timeMax: dayEndISO,
-      singleEvents: true,
-      orderBy: 'startTime'
+      calendarId: CAL_ID, timeMin: dayStartISO, timeMax: dayEndISO,
+      singleEvents: true, orderBy: 'startTime'
     });
     const dayCount = (dayList.data.items || []).filter(e => e.status !== 'cancelled').length;
     if (dayCount >= MAX_PER_DAY){
       return res.status(409).json({ ok:false, error:'capacity_day_limit', detail:'Max 3 events per day reached.' });
     }
 
-    // 2) Max 2 overlapping within op window
+    // 2) Max 2 overlapping within operational window
     const overlapList = await calendar.events.list({
-      calendarId: CAL_ID,
-      timeMin: opStartISO,
-      timeMax: opEndISO,
-      singleEvents: true,
-      orderBy: 'startTime'
+      calendarId: CAL_ID, timeMin: opStartISO, timeMax: opEndISO,
+      singleEvents: true, orderBy: 'startTime'
     });
     const overlapping = (overlapList.data.items || []).filter(ev=>{
       if (ev.status === 'cancelled') return false;
@@ -127,36 +117,35 @@ export default async function handler(req, res){
       return res.status(409).json({ ok:false, error:'capacity_overlap_limit', detail:'Max 2 concurrent events in the operational window.' });
     }
 
-    // Build attendees
+    // Attendees
     const attendees = [];
     const clientEmail    = s(body.email);
     const affiliateEmail = s(body.affiliateEmail);
     if (clientEmail) attendees.push({ email: clientEmail });
     if (affiliateEmail) attendees.push({ email: affiliateEmail });
 
-    const liveHrs = serviceHours(pkg);
-    const endServiceISO = new Date(new Date(startISO).getTime() + liveHrs * 3600_000).toISOString();
-
     const title = `Manna Snack Bars — ${barLabel(mainBar)} — ${pkgLabel(pkg)} — ${fullName}`;
+    const description = [
+      `📦 Package: ${pkgLabel(pkg)}`,
+      `🍫 Main bar: ${barLabel(mainBar)}`,
+      body.secondEnabled ? `➕ Second bar: ${barLabel(s(body.secondBar))} (${pkgLabel(s(body.secondSize))})` : '',
+      body.fountainEnabled ? `🫗 Chocolate fountain: ${s(body.fountainType)} for ${s(body.fountainSize)} ppl` : '',
+      notes ? `📝 Notes: ${notes}` : '',
+      '',
+      `⏱️ Prep: 1h before start`,
+      `⏱️ Service: ${live}h (+ 1h cleanup)`,
+      `🧮 Operational window: ${new Date(opStartISO).toLocaleString('en-US',{timeZone:TZ})} → ${new Date(opEndISO).toLocaleString('en-US',{timeZone:TZ})}`,
+      '',
+      `👤 Affiliate: ${aff.name} (PIN: ${pin})`,
+    ].filter(Boolean).join('\n');
 
+    // IMPORTANT: block the full operational window in the calendar
     const event = {
       summary: title,
       location: venue || undefined,
-      description: [
-        `📦 Package: ${pkgLabel(pkg)}`,
-        `🍫 Main bar: ${barLabel(mainBar)}`,
-        body.secondEnabled ? `➕ Second bar: ${barLabel(s(body.secondBar))} (${pkgLabel(s(body.secondSize))})` : '',
-        body.fountainEnabled ? `🍫 Chocolate fountain: ${s(body.fountainType)} for ${s(body.fountainSize)} ppl` : '',
-        notes ? `📝 Notes: ${notes}` : '',
-        '',
-        `⏱️ Prep: 1h before start`,
-        `⏱️ Service: ${liveHrs}h (+ 1h cleanup)`,
-        `🧮 Operational window: ${new Date(opStartISO).toLocaleString('en-US',{timeZone:TZ})} → ${new Date(opEndISO).toLocaleString('en-US',{timeZone:TZ})}`,
-        '',
-        `👤 Affiliate: ${aff.name} (PIN: ${pin})`,
-      ].filter(Boolean).join('\n'),
-      start: { dateTime: startISO, timeZone: TZ },
-      end:   { dateTime: endServiceISO, timeZone: TZ },
+      description,
+      start: { dateTime: opStartISO, timeZone: TZ },
+      end:   { dateTime: opEndISO,   timeZone: TZ },
       attendees: attendees.length ? attendees : undefined,
       guestsCanSeeOtherGuests: true,
       reminders: { useDefault: true },
